@@ -35,10 +35,8 @@ function AgentBuilderContent() {
   }
 
   return (
-    <main className="flex min-h-screen flex-col">
-      <div className="flex-1">
-        <WorkflowBuilder agentId={agentId || undefined} />
-      </div>
+    <main className="h-dvh overflow-hidden">
+      <WorkflowBuilder agentId={agentId || undefined} />
     </main>
   )
 }

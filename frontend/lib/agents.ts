@@ -1,12 +1,16 @@
-import { supabase, type Agent } from './supabase'
+import { supabase, type Agent, type ToolConnection, type AgentPolicies, type AgentType } from './supabase'
 
 export async function createAgent(
   userId: string,
   name: string,
   description: string | null,
-  tools: Array<{ tool: string; next_tool: string | null }>
+  tools: ToolConnection[],
+  options?: {
+    agent_type?: AgentType
+    policies?: AgentPolicies
+    tool_configs?: Record<string, unknown>
+  }
 ): Promise<Agent> {
-  // Generate random API key
   const apiKey = generateApiKey()
 
   const { data, error } = await supabase
@@ -17,6 +21,9 @@ export async function createAgent(
       description,
       api_key: apiKey,
       tools,
+      agent_type: options?.agent_type || 'general',
+      policies: options?.policies || {},
+      tool_configs: options?.tool_configs || {},
     })
     .select()
     .single()
@@ -51,7 +58,7 @@ export async function getAgentById(agentId: string): Promise<Agent | null> {
 
   if (error) {
     if (error.code === 'PGRST116') {
-      return null // Not found
+      return null
     }
     throw new Error(`Failed to fetch agent: ${error.message}`)
   }
@@ -68,7 +75,7 @@ export async function getAgentByApiKey(apiKey: string): Promise<Agent | null> {
 
   if (error) {
     if (error.code === 'PGRST116') {
-      return null // Not found
+      return null
     }
     throw new Error(`Failed to fetch agent: ${error.message}`)
   }
@@ -81,7 +88,10 @@ export async function updateAgent(
   updates: {
     name?: string
     description?: string | null
-    tools?: Array<{ tool: string; next_tool: string | null }>
+    tools?: ToolConnection[]
+    agent_type?: AgentType
+    policies?: AgentPolicies
+    tool_configs?: Record<string, unknown>
   }
 ): Promise<Agent> {
   const { data, error } = await supabase
@@ -107,7 +117,6 @@ export async function deleteAgent(agentId: string): Promise<void> {
 }
 
 function generateApiKey(): string {
-  // Generate a random 32-character API key
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
   let result = ''
   for (let i = 0; i < 32; i++) {
@@ -115,4 +124,3 @@ function generateApiKey(): string {
   }
   return result
 }
-

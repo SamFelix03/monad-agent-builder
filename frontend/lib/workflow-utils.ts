@@ -1,5 +1,7 @@
-import type { Node, XYPosition } from "reactflow"
-import type { NodeData } from "./types"
+import type { Node, XYPosition } from 'reactflow'
+import type { NodeData } from './types'
+import { getToolByName, getToolDescription, getToolLabel } from './tool-registry'
+import { getDefaultPoliciesForTool } from './policies'
 
 let toolIdCounter = 0
 
@@ -24,39 +26,30 @@ export const createNode = ({
     data: {
       label: getDefaultLabel(type),
       description: getDefaultDescription(type),
+      policies: getDefaultPoliciesForTool(type),
       config: {},
     },
   }
 }
 
-const getDefaultLabel = (type: string): string => {
-  const labels: Record<string, string> = {
-    transfer: "Transfer",
-    swap: "Swap",
-    get_balance: "Get Balance",
-    deploy_erc20: "Deploy ERC-20",
-    deploy_erc721: "Deploy ERC-721",
-    create_dao: "Create DAO",
-    airdrop: "Airdrop",
-    fetch_price: "Fetch Price",
-    deposit_yield: "Deposit Yield",
-    wallet_analytics: "Wallet Analytics",
+const getDefaultLabel = (type: string): string => getToolLabel(type)
+const getDefaultDescription = (type: string): string => getToolDescription(type)
+
+export function enrichNodeFromRegistry(node: Node<NodeData>): Node<NodeData> {
+  if (!node.type || node.type === 'agent') return node
+  const meta = getToolByName(node.type)
+  if (!meta) return node
+  return {
+    ...node,
+    data: {
+      ...node.data,
+      label: meta.label,
+      description: meta.description,
+      policies: node.data.policies ?? getDefaultPoliciesForTool(node.type),
+    },
   }
-  return labels[type] || "Tool"
 }
 
-const getDefaultDescription = (type: string): string => {
-  const descriptions: Record<string, string> = {
-    transfer: "Transfer tokens or assets",
-    swap: "Swap tokens",
-    get_balance: "Get wallet balance",
-    deploy_erc20: "Deploy ERC-20 token",
-    deploy_erc721: "Deploy ERC-721 NFT",
-    create_dao: "Create a new DAO",
-    airdrop: "Airdrop tokens to addresses",
-    fetch_price: "Fetch token price",
-    deposit_yield: "Deposit to yield farming",
-    wallet_analytics: "Analyze wallet data",
-  }
-  return descriptions[type] || "Workflow tool"
+export function enrichNodesFromRegistry(nodes: Node<NodeData>[]): Node<NodeData>[] {
+  return nodes.map(enrichNodeFromRegistry)
 }

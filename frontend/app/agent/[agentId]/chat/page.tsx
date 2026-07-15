@@ -12,6 +12,9 @@ import { cn } from "@/lib/utils"
 import { toast } from "@/components/ui/use-toast"
 import { getAgentById } from "@/lib/agents"
 import type { Agent } from "@/lib/supabase"
+import { useAuth } from "@/lib/auth"
+import { Input } from "@/components/ui/input"
+import { formatToolName } from "@/lib/tool-registry"
 
 interface Message {
   id: string
@@ -31,12 +34,22 @@ interface AgentChatResponse {
     success: boolean
     tool: string
     result: any
+    policy_decision?: string
+    approval?: { id: string; summary?: string }
+    summary?: string
+    message?: string
+  }>
+  pending_approvals?: Array<{
+    approval?: { id: string }
+    summary?: string
+    tool?: string
   }>
 }
 
 export default function AgentChatPage() {
   const router = useRouter()
   const params = useParams()
+  const { user } = useAuth()
   const agentId = params.agentId as string
   
   const [agent, setAgent] = useState<Agent | null>(null)
@@ -44,6 +57,9 @@ export default function AgentChatPage() {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState("")
   const [isLoading, setIsLoading] = useState(false)
+  const [resolvingApproval, setResolvingApproval] = useState<string | null>(null)
+  const [sessionBudget, setSessionBudget] = useState("50")
+  const [creatingSession, setCreatingSession] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
@@ -94,6 +110,121 @@ export default function AgentChatPage() {
       setTimeout(() => textareaRef.current?.focus(), 100)
     }
   }, [loadingAgent])
+
+  const handleCreateShoppingSession = async () => {
+    if (!agent || !user?.id) return
+    setCreatingSession(true)
+    try {
+      const response = await fetch(`/api/agent/sessions/${agent.id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId: user.id,
+          budgetUsd: Number(sessionBudget) || 50,
+          merchantAllowlist: ["mock"],
+          expiresInHours: 24,
+        }),
+      })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error || "Failed to create session")
+      toast({
+        title: "Shopping session created",
+        description: `Budget: $${sessionBudget} for 24 hours`,
+      })
+    } catch (error: unknown) {
+      toast({
+        title: "Error",
+        description: error instanceof Error ? error.message : "Failed to create session",
+        variant: "destructive",
+      })
+    } finally {
+      setCreatingSession(false)
+    }
+  }
+
+  const handleResolveApproval = async (approvalId: string, status: "approved" | "rejected") => {
+    setResolvingApproval(approvalId)
+    try {
+      const response = await fetch(`/api/agent/approvals/${approvalId}/resolve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status, resolvedBy: "user" }),
+      })
+      if (!response.ok) {
+        const err = await response.json()
+        throw new Error(err.error || "Failed to resolve approval")
+      }
+      toast({
+        title: status === "approved" ? "Approved" : "Rejected",
+        description:
+          status === "approved"
+            ? "You can ask the agent to retry the action with the approvalId."
+            : "Action was rejected.",
+      })
+    } catch (error: unknown) {
+      toast({
+        title: "Error",
+        description: error instanceof Error ? error.message : "Failed to resolve approval",
+        variant: "destructive",
+      })
+    } finally {
+      setResolvingApproval(null)
+    }
+  }
+
+  const renderPendingApprovals = (response: AgentChatResponse) => {
+    const pending = response.pending_approvals || []
+    const fromResults = response.results
+      .filter((r) => r.policy_decision === "pending_approval")
+      .map((r) => ({
+        approval: r.approval,
+        summary: r.summary || r.message,
+        tool: r.tool,
+      }))
+    const all = [...pending, ...fromResults]
+    if (all.length === 0) return null
+
+    return (
+      <div className="mt-4 space-y-2">
+        <h4 className="text-sm font-semibold text-amber-600 dark:text-amber-400">Pending Approval</h4>
+        {all.map((item, idx) => {
+          const approvalId = item.approval?.id
+          if (!approvalId) return null
+          return (
+            <Card key={`${approvalId}-${idx}`} className="border-amber-500/40 shadow-none">
+              <CardContent className="space-y-3 pt-4">
+                <p className="text-sm">{item.summary || "This action requires your approval."}</p>
+                {item.tool && (
+                  <Badge variant="outline">{formatToolName(item.tool)}</Badge>
+                )}
+                <div className="flex gap-2">
+                  <Button
+                    size="sm"
+                    variant="brand"
+                    disabled={resolvingApproval === approvalId}
+                    onClick={() => handleResolveApproval(approvalId, "approved")}
+                  >
+                    Approve
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={resolvingApproval === approvalId}
+                    onClick={() => handleResolveApproval(approvalId, "rejected")}
+                  >
+                    Reject
+                  </Button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  After approving, tell the agent: &quot;Proceed with approvalId {approvalId}&quot;
+                </p>
+              </CardContent>
+            </Card>
+          )
+        })}
+      </div>
+    )
+  }
 
   const handleSend = async () => {
     if (!input.trim() || isLoading || !agent || !agent.api_key) return
@@ -193,12 +324,6 @@ export default function AgentChatPage() {
     return obj
   }
 
-  const formatToolName = (tool: string): string => {
-    return tool
-      .split("_")
-      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-      .join(" ")
-  }
 
   const renderToolResult = (result: any, tool: string) => {
     if (!result?.result) return null
@@ -392,6 +517,25 @@ export default function AgentChatPage() {
               <h1 className="text-lg font-semibold tracking-tight">{agent.name}</h1>
             </div>
           </div>
+          {(agent.agent_type === "shopping" || agent.agent_type === "hybrid") && (
+            <div className="ml-auto flex items-center gap-2">
+              <Input
+                type="number"
+                className="h-8 w-20"
+                value={sessionBudget}
+                onChange={(e) => setSessionBudget(e.target.value)}
+                aria-label="Session budget USD"
+              />
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={creatingSession}
+                onClick={handleCreateShoppingSession}
+              >
+                {creatingSession ? "..." : "Start shop session"}
+              </Button>
+            </div>
+          )}
         </div>
       </div>
 
@@ -433,6 +577,8 @@ export default function AgentChatPage() {
               <div className="whitespace-pre-wrap text-sm leading-relaxed">{message.content}</div>
               {message.agentResponse && (
                 <div className="mt-4 space-y-4 border-t border-border/40 pt-4">
+                  {renderPendingApprovals(message.agentResponse)}
+
                   {/* Tool Calls */}
                   {message.agentResponse.tool_calls && message.agentResponse.tool_calls.length > 0 && (
                     <div>

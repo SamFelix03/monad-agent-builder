@@ -275,6 +275,24 @@
     border-color: color-mix(in oklch, var(--border) 60%, transparent);
   }
 
+  .floating-card {
+    border-radius: 1rem;
+    border: 1px solid color-mix(in oklch, var(--border) 60%, transparent);
+    background: color-mix(in oklch, var(--card) 92%, transparent);
+    box-shadow: 0 4px 24px color-mix(in oklch, black 4%, transparent);
+  }
+
+  .floating-tool-panel {
+    border-radius: 1rem;
+    border: 1px solid color-mix(in oklch, var(--border) 55%, transparent);
+    background: color-mix(in oklch, var(--card) 68%, transparent);
+    backdrop-filter: blur(20px) saturate(1.2);
+    -webkit-backdrop-filter: blur(20px) saturate(1.2);
+    box-shadow:
+      0 8px 32px color-mix(in oklch, black 8%, transparent),
+      inset 0 1px 0 color-mix(in oklch, white 35%, transparent);
+  }
+
   .btn-brand {
     display: inline-flex;
     align-items: center;
@@ -425,6 +443,25 @@
     border: 1px solid color-mix(in oklch, var(--border) 55%, transparent);
     border-radius: 9999px;
     box-shadow: 0 4px 20px color-mix(in oklch, black 5%, transparent);
+  }
+
+  .workflow-canvas {
+    position: relative;
+    isolation: isolate;
+  }
+
+  .workflow-canvas .react-flow {
+    width: 100%;
+    height: 100%;
+  }
+
+  .scrollbar-hidden {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .scrollbar-hidden::-webkit-scrollbar {
+    display: none;
   }
 }
 

@@ -23,17 +23,21 @@ import "reactflow/dist/style.css"
 import { toast } from "@/components/ui/use-toast"
 import { Button } from "@/components/ui/button"
 import { Save, ArrowLeft } from "lucide-react"
-import NodeLibrary from "./node-library"
-import NodeConfigPanel from "./node-config-panel"
+import { ToolLibraryPanel } from "./tool-library-panel"
+import { NodeConfigFloatingPanel } from "./node-config-floating-panel"
 import CustomEdge from "./custom-edge"
 import { ToolNode } from "./nodes/tool-node"
 import { AgentNode } from "./nodes/agent-node"
-import { generateNodeId, createNode } from "@/lib/workflow-utils"
+import { generateNodeId, createNode, enrichNodesFromRegistry } from "@/lib/workflow-utils"
 import type { WorkflowNode } from "@/lib/types"
 import { AIChatModal } from "./ai-chat-modal"
 import { useAuth } from "@/lib/auth"
 import { createAgent, getAgentById, updateAgent } from "@/lib/agents"
 import { workflowToTools, toolsToWorkflow } from "@/lib/workflow-converter"
+import { getWorkflowToolTypes } from "@/lib/tool-registry"
+import { inferAgentType, aggregateToolsPolicies } from "@/lib/policies"
+import { buildTemplateWorkflow } from "@/lib/template-builder"
+import { TOOL_PANEL_CHROME_LEFT } from "@/lib/workflow-layout"
 import {
   AlertDialog,
   AlertDialogAction,
@@ -56,31 +60,12 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 
-const toolTypes = [
-  "transfer",
-  "swap",
-  "get_balance",
-  "deploy_erc20",
-  "deploy_erc721",
-  "create_dao",
-  "airdrop",
-  "fetch_price",
-  "deposit_yield",
-  "wallet_analytics",
-]
+const workflowToolTypes = getWorkflowToolTypes()
 
 const nodeTypes: NodeTypes = {
   agent: AgentNode,
-  transfer: ToolNode,
-  swap: ToolNode,
-  get_balance: ToolNode,
-  deploy_erc20: ToolNode,
-  deploy_erc721: ToolNode,
-  create_dao: ToolNode,
-  airdrop: ToolNode,
-  fetch_price: ToolNode,
-  deposit_yield: ToolNode,
-  wallet_analytics: ToolNode,
+  default: ToolNode,
+  ...Object.fromEntries(workflowToolTypes.map((t) => [t, ToolNode])),
 }
 
 const edgeTypes: EdgeTypes = {
@@ -121,6 +106,7 @@ export default function WorkflowBuilder({ agentId }: WorkflowBuilderProps) {
   const [showSaveDialog, setShowSaveDialog] = useState(false)
   const [agentName, setAgentName] = useState("")
   const [agentDescription, setAgentDescription] = useState("")
+  const [activeTemplate, setActiveTemplate] = useState<string | null>(null)
   const [loadingAgent, setLoadingAgent] = useState(false)
   const [saving, setSaving] = useState(false)
 
@@ -166,7 +152,7 @@ export default function WorkflowBuilder({ agentId }: WorkflowBuilderProps) {
       const type = event.dataTransfer.getData("application/reactflow")
 
       // Check if the dropped element is valid
-      if (typeof type === "undefined" || !type || !toolTypes.includes(type)) {
+      if (typeof type === "undefined" || !type || !workflowToolTypes.includes(type)) {
         return
       }
 
@@ -183,7 +169,7 @@ export default function WorkflowBuilder({ agentId }: WorkflowBuilderProps) {
         })
 
         setNodes((nds) => {
-          const updatedNodes = nds.concat(newNode)
+          const updatedNodes = enrichNodesFromRegistry(nds.concat(newNode))
           // Auto-connect new node to agent node if it's a starting node
           // (nodes with no incoming edges will be connected to agent)
           setEdges((eds) => {
@@ -236,6 +222,39 @@ export default function WorkflowBuilder({ agentId }: WorkflowBuilderProps) {
     [setNodes],
   )
 
+  const applyTemplate = useCallback(
+    (templateKey: string) => {
+      const built = buildTemplateWorkflow(templateKey, AGENT_NODE_ID)
+      if (!built) {
+        toast({
+          title: "Unknown template",
+          description: "Could not load that template",
+          variant: "destructive",
+        })
+        return
+      }
+
+      const agentNode = createAgentNode()
+      const allNodes = enrichNodesFromRegistry([agentNode, ...built.nodes])
+      setNodes(allNodes)
+      setEdges(built.edges)
+      setActiveTemplate(templateKey)
+
+      if (!agentName.trim()) setAgentName(built.name)
+      if (!agentDescription.trim()) setAgentDescription(built.description)
+
+      setTimeout(() => {
+        reactFlowInstance?.fitView({ padding: 0.2 })
+      }, 100)
+
+      toast({
+        title: "Template applied",
+        description: built.description || "Tool chain added to canvas",
+      })
+    },
+    [reactFlowInstance, agentName, agentDescription, setNodes, setEdges],
+  )
+
   const handleSaveClick = () => {
     // Check if there are any tool nodes (excluding agent node)
     const toolNodes = nodes.filter((node) => node.id !== AGENT_NODE_ID)
@@ -274,13 +293,17 @@ export default function WorkflowBuilder({ agentId }: WorkflowBuilderProps) {
     setSaving(true)
     try {
       const tools = workflowToTools(nodes, edges, AGENT_NODE_ID)
+      const toolNames = tools.map((t) => t.tool)
+      const resolvedType = inferAgentType(toolNames)
+      const policies = aggregateToolsPolicies(tools)
 
       if (agentId) {
-        // Update existing agent
         await updateAgent(agentId, {
           name: agentName,
           description: agentDescription || null,
           tools,
+          agent_type: resolvedType,
+          policies,
         })
         toast({
           title: "Agent updated",
@@ -299,7 +322,10 @@ export default function WorkflowBuilder({ agentId }: WorkflowBuilderProps) {
           })
           return
         }
-        const agent = await createAgent(user.id, agentName, agentDescription || null, tools)
+        const agent = await createAgent(user.id, agentName, agentDescription || null, tools, {
+          agent_type: resolvedType,
+          policies,
+        })
         toast({
           title: "Agent created",
           description: "Your agent has been created successfully",
@@ -365,12 +391,9 @@ export default function WorkflowBuilder({ agentId }: WorkflowBuilderProps) {
 
         setAgentName(agent.name)
         setAgentDescription(agent.description || "")
-        
-        // Convert tools back to workflow format and display on canvas
         if (agent.tools && agent.tools.length > 0) {
           const { nodes: loadedNodes, edges: loadedEdges } = toolsToWorkflow(agent.tools, AGENT_NODE_ID)
-          // Ensure agent node is included
-          const allNodes = [createAgentNode(), ...loadedNodes]
+          const allNodes = enrichNodesFromRegistry([createAgentNode(), ...loadedNodes])
           setNodes(allNodes)
           setEdges(loadedEdges)
           
@@ -399,77 +422,84 @@ export default function WorkflowBuilder({ agentId }: WorkflowBuilderProps) {
   }
 
   return (
-    <div className="flex h-screen bg-background">
-      <div className="panel-glass w-64 shrink-0 border-r p-4">
-        <NodeLibrary />
-      </div>
+    <div className="relative h-full w-full overflow-hidden bg-background">
+      <div className="workflow-canvas relative h-full min-h-0 w-full" ref={reactFlowWrapper}>
+        <ReactFlowProvider>
+          <ReactFlow
+            className="h-full w-full"
+            nodes={nodes}
+            edges={edges}
+            onNodesChange={handleNodesChange}
+            onEdgesChange={onEdgesChange}
+            onConnect={onConnect}
+            onInit={setReactFlowInstance}
+            onDrop={onDrop}
+            onDragOver={onDragOver}
+            onNodeClick={onNodeClick}
+            onPaneClick={onPaneClick}
+            nodeTypes={nodeTypes}
+            edgeTypes={edgeTypes}
+            fitView
+            fitViewOptions={{ padding: 0.2 }}
+            snapToGrid
+            snapGrid={[15, 15]}
+            defaultEdgeOptions={{ type: "custom" }}
+          >
+            <Background />
+            <Controls
+              className="!bottom-3"
+              style={{ left: TOOL_PANEL_CHROME_LEFT }}
+            />
+            <MiniMap className="!right-3 !bottom-3" />
+            <Panel position="top-right" className="!m-3">
+              <div className="toolbar-pill">
+                <Button onClick={handleSaveClick} size="sm" variant="outline" disabled={loadingAgent}>
+                  <Save className="mr-1.5 h-4 w-4" />
+                  {agentId ? "Update Agent" : "Save Agent"}
+                </Button>
+              </div>
+            </Panel>
+          </ReactFlow>
+        </ReactFlowProvider>
 
-      <div className="flex-1 flex flex-col">
-        <div className="flex-1" ref={reactFlowWrapper}>
-          <ReactFlowProvider>
-            <ReactFlow
-              nodes={nodes}
-              edges={edges}
-              onNodesChange={handleNodesChange}
-              onEdgesChange={onEdgesChange}
-              onConnect={onConnect}
-              onInit={setReactFlowInstance}
-              onDrop={onDrop}
-              onDragOver={onDragOver}
-              onNodeClick={onNodeClick}
-              onPaneClick={onPaneClick}
-              nodeTypes={nodeTypes}
-              edgeTypes={edgeTypes}
-              fitView
-              snapToGrid
-              snapGrid={[15, 15]}
-              defaultEdgeOptions={{ type: "custom" }}
+        <div
+          className="pointer-events-none absolute top-4 z-30"
+          style={{ left: TOOL_PANEL_CHROME_LEFT }}
+        >
+          <div className="toolbar-pill pointer-events-auto">
+            <Button
+              onClick={handleBackClick}
+              size="sm"
+              variant="ghost"
+              className="rounded-full"
             >
-              <Background />
-              <Controls />
-              <MiniMap />
-              <Panel position="top-left">
-                <div className="toolbar-pill">
-                  <Button
-                    onClick={handleBackClick}
-                    size="sm"
-                    variant="ghost"
-                    className="rounded-full"
-                  >
-                    <ArrowLeft className="mr-1.5 h-4 w-4" />
-                    Back
-                  </Button>
-                  <Button
-                    onClick={() => setIsAIChatOpen(true)}
-                    size="sm"
-                    variant="brand"
-                  >
-                    Create with AI
-                  </Button>
-                </div>
-              </Panel>
-              <Panel position="top-right">
-                <div className="toolbar-pill">
-                  <Button onClick={handleSaveClick} size="sm" variant="outline" disabled={loadingAgent}>
-                    <Save className="mr-1.5 h-4 w-4" />
-                    {agentId ? "Update Agent" : "Save Agent"}
-                  </Button>
-                </div>
-              </Panel>
-            </ReactFlow>
-          </ReactFlowProvider>
+              <ArrowLeft className="mr-1.5 h-4 w-4" />
+              Back
+            </Button>
+            <Button
+              onClick={() => setIsAIChatOpen(true)}
+              size="sm"
+              variant="brand"
+            >
+              Create with AI
+            </Button>
+          </div>
         </div>
-      </div>
 
-      {selectedNode && selectedNode.id !== AGENT_NODE_ID && (
-        <div className="panel-glass w-80 shrink-0 border-l p-4">
-          <NodeConfigPanel
+        <ToolLibraryPanel
+          activeTemplate={activeTemplate}
+          onSelectTemplate={applyTemplate}
+          disabled={loadingAgent}
+        />
+
+        {selectedNode && selectedNode.id !== AGENT_NODE_ID && (
+          <NodeConfigFloatingPanel
             node={selectedNode as WorkflowNode}
             updateNodeData={updateNodeData}
             onClose={() => setSelectedNode(null)}
           />
-        </div>
-      )}
+        )}
+      </div>
 
       <AIChatModal
         open={isAIChatOpen}
@@ -477,7 +507,7 @@ export default function WorkflowBuilder({ agentId }: WorkflowBuilderProps) {
         onApplyWorkflow={(aiNodes, aiEdges) => {
           // Ensure agent node is included and connect starting nodes to it
           const agentNode = createAgentNode()
-          const allNodes = [agentNode, ...aiNodes]
+          const allNodes = enrichNodesFromRegistry([agentNode, ...aiNodes])
           
           // Find starting nodes (nodes with no incoming edges)
           const nodesWithIncoming = new Set<string>()
@@ -532,11 +562,11 @@ export default function WorkflowBuilder({ agentId }: WorkflowBuilderProps) {
       </AlertDialog>
 
       <Dialog open={showSaveDialog} onOpenChange={setShowSaveDialog}>
-        <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
+        <DialogContent className="max-w-lg">
           <DialogHeader>
             <DialogTitle>{agentId ? "Update Agent" : "Create Agent"}</DialogTitle>
             <DialogDescription>
-              Enter the name and description for your agent. The workflow will be saved with all configured tools.
+              Name your agent. Tool chains and per-node guardrails are saved from the canvas.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
@@ -560,17 +590,11 @@ export default function WorkflowBuilder({ agentId }: WorkflowBuilderProps) {
                 rows={3}
               />
             </div>
-            <div className="space-y-2">
-              <Label>Tools to be saved</Label>
-              <div className="surface-row p-3">
-                <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-xs">
-                  {JSON.stringify(workflowToTools(nodes, edges, AGENT_NODE_ID), null, 2)}
-                </pre>
-              </div>
-              <p className="text-xs text-muted-foreground">
-                This is the tools array that will be saved to Supabase
-              </p>
-            </div>
+            <p className="text-xs text-muted-foreground">
+              {nodes.filter((n) => n.id !== AGENT_NODE_ID).length} tool
+              {nodes.filter((n) => n.id !== AGENT_NODE_ID).length === 1 ? "" : "s"} configured.
+              Click any tool node to edit its guardrails.
+            </p>
           </div>
           <DialogFooter>
             <Button
