@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import os
 from dotenv import load_dotenv
@@ -8,353 +8,409 @@ import json
 import requests
 import uvicorn
 
+from registry_loader import (
+    get_tool_definitions,
+    get_available_tool_names,
+    resolve_tool_name,
+    get_default_policies,
+)
+from policy import PolicyEngine, resolve_policies_for_tool, resolve_config_for_tool, merge_policies
+from db import fetch_spend_state, log_action, create_approval, get_approved_ids, is_configured
+
 load_dotenv()
 
-# Monad backend (Express) — override with BACKEND_BASE_URL e.g. http://localhost:3000
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:3000").rstrip("/")
-
-# Groq LLM (OpenAI-compatible chat + tool calling). Set GROQ_API_KEY in .env
-# Default model: strong tool-use and reasoning; override with GROQ_MODEL if needed.
+SERVICE_SECRET = os.getenv("SERVICE_SECRET", "dev-service-secret-change-me")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 _groq_key = os.getenv("GROQ_API_KEY")
 client: Optional[Groq] = Groq(api_key=_groq_key) if _groq_key else None
 
+TOOL_DEFINITIONS = get_tool_definitions(BACKEND_BASE_URL)
+
 app = FastAPI(title="Monad AI Agent Builder")
 
-# Tool Definitions
-TOOL_DEFINITIONS = {
-    "transfer": {
-        "name": "transfer",
-        "description": "Transfer tokens from one address to another. Requires privateKey, toAddress, amount, and tokenAddress.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "privateKey": {"type": "string", "description": "Private key of the sender wallet"},
-                "toAddress": {"type": "string", "description": "Recipient wallet address"},
-                "amount": {"type": "string", "description": "Amount of tokens to transfer"},
-                "tokenAddress": {"type": "string", "description": "Contract address of the token"}
-            },
-            "required": ["privateKey", "toAddress", "amount", "tokenAddress"]
-        },
-        "endpoint": f"{BACKEND_BASE_URL}/transfer",
-        "method": "POST"
-    },
-    "swap": {
-        "name": "swap",
-        "description": "Swap one token for another. Requires privateKey, tokenIn, tokenOut, amountIn, and slippageTolerance.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "privateKey": {"type": "string", "description": "Private key of the wallet"},
-                "tokenIn": {"type": "string", "description": "Input token contract address"},
-                "tokenOut": {"type": "string", "description": "Output token contract address"},
-                "amountIn": {"type": "string", "description": "Amount of input tokens"},
-                "slippageTolerance": {"type": "number", "description": "Slippage tolerance percentage"}
-            },
-            "required": ["privateKey", "tokenIn", "tokenOut", "amountIn", "slippageTolerance"]
-        },
-        "endpoint": f"{BACKEND_BASE_URL}/swap",
-        "method": "POST"
-    },
-    "get_balance": {
-        "name": "get_balance",
-        "description": "Get Monad Testnet wallet analytics: native MON balance plus ERC-20 positions (via Moralis). Requires wallet address.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "address": {"type": "string", "description": "Wallet address (0x…) to analyze"}
-            },
-            "required": ["address"]
-        },
-        "endpoint": f"{BACKEND_BASE_URL}/api/balance/erc20",
-        "method": "POST"
-    },
-    "deploy_erc20": {
-        "name": "deploy_erc20",
-        "description": "Deploy a new ERC-20 token on Monad Testnet via TokenFactory. Requires privateKey, name, symbol, decimals, and initialSupply (human-readable supply, not wei).",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "privateKey": {"type": "string", "description": "Private key of the deployer wallet"},
-                "name": {"type": "string", "description": "Token name"},
-                "symbol": {"type": "string", "description": "Token symbol"},
-                "decimals": {"type": "integer", "description": "Token decimals (commonly 18)"},
-                "initialSupply": {"type": "number", "description": "Initial supply in human units (e.g. 1000000), not totalSupply"}
-            },
-            "required": ["privateKey", "name", "symbol", "decimals", "initialSupply"]
-        },
-        "endpoint": f"{BACKEND_BASE_URL}/deploy-token",
-        "method": "POST"
-    },
-    "deploy_erc721": {
-        "name": "deploy_erc721",
-        "description": "Deploy a new ERC-721 NFT collection. Requires privateKey, name, and symbol.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "privateKey": {"type": "string", "description": "Private key of the deployer wallet"},
-                "name": {"type": "string", "description": "NFT collection name"},
-                "symbol": {"type": "string", "description": "NFT collection symbol"}
-            },
-            "required": ["privateKey", "name", "symbol"]
-        },
-        "endpoint": f"{BACKEND_BASE_URL}/create-nft-collection",
-        "method": "POST"
-    },
-    "create_dao": {
-        "name": "create_dao",
-        "description": "Create a new DAO (Decentralized Autonomous Organization). Requires privateKey, name, votingPeriod, and quorumPercentage.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "privateKey": {"type": "string", "description": "Private key of the DAO creator"},
-                "name": {"type": "string", "description": "DAO name"},
-                "votingPeriod": {"type": "string", "description": "Voting period in seconds"},
-                "quorumPercentage": {"type": "string", "description": "Quorum percentage required for voting"}
-            },
-            "required": ["privateKey", "name", "votingPeriod", "quorumPercentage"]
-        },
-        "endpoint": f"{BACKEND_BASE_URL}/create-dao",
-        "method": "POST"
-    },
-    "airdrop": {
-        "name": "airdrop",
-        "description": "Airdrop tokens to multiple recipients. Requires privateKey, recipients (list of addresses), and amount per recipient.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "privateKey": {"type": "string", "description": "Private key of the sender wallet"},
-                "recipients": {"type": "array", "items": {"type": "string"}, "description": "List of recipient wallet addresses"},
-                "amount": {"type": "string", "description": "Amount to send to each recipient"}
-            },
-            "required": ["privateKey", "recipients", "amount"]
-        },
-        "endpoint": f"{BACKEND_BASE_URL}/airdrop",
-        "method": "POST"
-    },
-    "fetch_price": {
-        "name": "fetch_price",
-        "description": "Fetch the current price of any cryptocurrency or token. Requires a query string.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Query string for token price (e.g., 'bitcoin current price')"}
-            },
-            "required": ["query"]
-        },
-        "endpoint": f"{BACKEND_BASE_URL}/token-price",
-        "method": "POST"
-    },
-    "deposit_yield": {
-        "name": "deposit_yield",
-        "description": "Create a deposit with yield prediction. Requires privateKey, tokenAddress, depositAmount, and apyPercent.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "privateKey": {"type": "string", "description": "Private key of the depositor wallet"},
-                "tokenAddress": {"type": "string", "description": "Token contract address to deposit"},
-                "depositAmount": {"type": "string", "description": "Amount to deposit"},
-                "apyPercent": {"type": "number", "description": "Annual Percentage Yield (APY) percentage"}
-            },
-            "required": ["privateKey", "tokenAddress", "depositAmount", "apyPercent"]
-        },
-        "endpoint": f"{BACKEND_BASE_URL}/yield",
-        "method": "POST"
-    },
-    "wallet_analytics": {
-        "name": "wallet_analytics",
-        "description": "Get Monad wallet analytics (native MON + ERC-20 positions via Moralis). Requires wallet address.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "address": {"type": "string", "description": "Wallet address to analyze"}
-            },
-            "required": ["address"]
-        },
-        "endpoint": f"{BACKEND_BASE_URL}/api/balance/erc20",
-        "method": "POST"
-    }
-}
 
-# Pydantic Models
 class ToolConnection(BaseModel):
     tool: str
     next_tool: Optional[str] = None
+    next_node_id: Optional[str] = None
+    node_id: Optional[str] = None
+    policies: Dict[str, Any] = Field(default_factory=dict)
+    config: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentPolicies(BaseModel):
+    max_trade_notional_usd: Optional[float] = None
+    daily_spend_budget_usd: Optional[float] = None
+    approval_threshold_usd: Optional[float] = None
+    max_slippage_bps: Optional[int] = None
+    allowed_tokens: Optional[List[str]] = None
+    require_quote_before_swap: Optional[bool] = None
+    max_order_usd: Optional[float] = None
+    daily_shopping_budget_usd: Optional[float] = None
+    merchant_allowlist: Optional[List[str]] = None
+    require_approval_for_checkout: Optional[bool] = None
+    read_only: Optional[bool] = None
+    cooldown_seconds: Optional[int] = None
+
 
 class AgentRequest(BaseModel):
     tools: List[ToolConnection]
     user_message: str
-    private_key: Optional[str] = None
+    agent_id: Optional[str] = None
+    user_id: Optional[str] = None
+    wallet_address: Optional[str] = None
+    agent_type: str = "general"
+    policies: Dict[str, Any] = Field(default_factory=dict)
+    tool_configs: Dict[str, Any] = Field(default_factory=dict)
+    private_key: Optional[str] = None  # deprecated: use user_id + internal signing
+
 
 class AgentResponse(BaseModel):
     agent_response: str
     tool_calls: List[Dict[str, Any]]
     results: List[Dict[str, Any]]
+    pending_approvals: List[Dict[str, Any]] = Field(default_factory=list)
 
-# Helper Functions
-def build_system_prompt(tool_connections: List[ToolConnection]) -> str:
-    """Build a dynamic system prompt based on connected tools"""
-    
-    # Extract unique tools
+
+def build_system_prompt(tool_connections: List[ToolConnection], wallet_address: Optional[str] = None) -> str:
     unique_tools = set()
     tool_flow = {}
-    
+
     for conn in tool_connections:
-        unique_tools.add(conn.tool)
+        name = resolve_tool_name(conn.tool)
+        unique_tools.add(name)
         if conn.next_tool:
-            unique_tools.add(conn.next_tool)
-            tool_flow[conn.tool] = conn.next_tool
-    
-    # Check if sequential execution exists
+            next_name = resolve_tool_name(conn.next_tool)
+            unique_tools.add(next_name)
+            tool_flow[name] = next_name
+
     has_sequential = any(conn.next_tool for conn in tool_connections)
-    
-    system_prompt = """You are an AI agent for Monad (high-performance EVM L1). You help users perform operations on Monad Testnet using the tools available to you.
+
+    system_prompt = """You are an AI agent for Monad (high-performance EVM L1). You help users with on-chain operations, trading, and shopping using only the tools available to you.
+
+TRADING RULES:
+- Always call quote_swap before swap and use the returned quoteId for swap.
+- For shopping, search → build_cart → checkout_quote → ask user to confirm → place_order with approvalId.
 
 AVAILABLE TOOLS:
 """
-    
+
     for tool_name in unique_tools:
         if tool_name in TOOL_DEFINITIONS:
             tool_def = TOOL_DEFINITIONS[tool_name]
             system_prompt += f"\n- {tool_name}: {tool_def['description']}\n"
-    
+
+    if wallet_address:
+        system_prompt += f"\nAgent wallet address: {wallet_address}\n"
+
     if has_sequential:
         system_prompt += "\n\nTOOL EXECUTION FLOW:\n"
-        system_prompt += "Some tools are connected in sequence. You MUST execute them in the specified order:\n"
         for tool, next_tool in tool_flow.items():
-            system_prompt += f"- After {tool} completes, YOU MUST IMMEDIATELY call {next_tool}\n"
-        
-        system_prompt += """
-SEQUENTIAL EXECUTION INSTRUCTIONS - CRITICAL:
-1. When tools are connected sequentially, you MUST execute ALL tools in the chain
-2. After completing one tool, IMMEDIATELY proceed to call the next tool in the sequence
-3. DO NOT wait for user confirmation between sequential tool calls
-4. Execute all sequential tools in ONE conversation turn
-5. Only provide a final summary after ALL sequential tools have been completed
-6. If you have all the required parameters for the entire sequence, execute all tools immediately
-"""
+            system_prompt += f"- After {tool} completes, call {next_tool}\n"
+        system_prompt += "\nExecute sequential tools in one turn without waiting for confirmation between steps.\n"
     else:
-        system_prompt += """
-INSTRUCTIONS:
-1. You can perform any of the available operations based on user requests
-2. Ask for required parameters if not provided
-3. Execute the appropriate tool based on user needs
-4. Provide clear results and next steps
-"""
-    
+        system_prompt += "\nAsk for required parameters before tool calls. Explain results clearly.\n"
+
     system_prompt += """
-IMPORTANT RULES:
-- Only use the tools that are available to you
-- Always ask for required parameters before making tool calls
-- Be conversational and helpful
-- If a privateKey is needed and provided in the context, use it
-- Provide transaction hashes and explorer links when available
-- Explain what each operation does in simple terms
-- For sequential executions, complete the ENTIRE chain before responding
+IMPORTANT:
+- Never ask for or mention private keys; signing is handled server-side.
+- Respect policy denials and pending approvals; explain alternatives.
+- Provide transaction hashes and explorer links when available.
 """
-    
     return system_prompt
 
-def execute_tool(tool_name: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
-    """Execute a tool by calling its API endpoint"""
-    
+
+def _fetch_quote_snapshot(quote_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        resp = requests.get(f"{BACKEND_BASE_URL}/quotes/{quote_id}", timeout=10)
+        if resp.ok:
+            return resp.json().get("quote")
+    except requests.RequestException:
+        pass
+    return None
+
+
+def _internal_headers() -> Dict[str, str]:
+    return {"Content-Type": "application/json", "x-service-secret": SERVICE_SECRET}
+
+
+def execute_tool_via_internal(
+    user_id: str,
+    agent_id: str,
+    tool_name: str,
+    parameters: Dict[str, Any],
+    policy_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    try:
+        resp = requests.post(
+            f"{BACKEND_BASE_URL}/internal/execute-tool",
+            headers=_internal_headers(),
+            json={
+                "userId": user_id,
+                "agentId": agent_id,
+                "tool": tool_name,
+                "parameters": parameters,
+                "policyContext": policy_context,
+            },
+            timeout=120,
+        )
+        data = resp.json()
+        if not resp.ok:
+            return {"success": False, "tool": tool_name, "error": data.get("error", resp.text)}
+        return {"success": True, "tool": tool_name, "result": data.get("result", data)}
+    except requests.RequestException as e:
+        return {"success": False, "tool": tool_name, "error": str(e)}
+
+
+def execute_tool(
+    tool_name: str,
+    parameters: Dict[str, Any],
+    *,
+    agent_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    wallet_address: Optional[str] = None,
+    agent_type: str = "general",
+    policies: Optional[Dict[str, Any]] = None,
+    tool_configs: Optional[Dict[str, Any]] = None,
+    tool_connections: Optional[List[ToolConnection]] = None,
+    private_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    tool_name = resolve_tool_name(tool_name)
+
     if tool_name not in TOOL_DEFINITIONS:
         raise ValueError(f"Unknown tool: {tool_name}")
 
     parameters = dict(parameters)
-    if tool_name == "deploy_erc20":
-        if "totalSupply" in parameters and "initialSupply" not in parameters:
-            parameters["initialSupply"] = parameters.pop("totalSupply")
-    
+
+    if tool_name == "deploy_erc20" and "totalSupply" in parameters and "initialSupply" not in parameters:
+        parameters["initialSupply"] = parameters.pop("totalSupply")
+
+    if tool_name in ("get_portfolio", "get_balance", "wallet_analytics") and "address" not in parameters and wallet_address:
+        parameters["address"] = wallet_address
+
+    if agent_id:
+        parameters.setdefault("agentId", agent_id)
+
     tool_def = TOOL_DEFINITIONS[tool_name]
+    quote_snapshot = None
+    if tool_name == "swap" and parameters.get("quoteId"):
+        quote_snapshot = _fetch_quote_snapshot(parameters["quoteId"])
+    elif tool_name == "checkout_quote" and parameters.get("cartId"):
+        quote_snapshot = {"cartId": parameters["cartId"]}
+
+    spend_state = fetch_spend_state(agent_id) if agent_id else {}
+    approved_ids = get_approved_ids(agent_id) if agent_id else []
+
+    connections = tool_connections or []
+    if connections:
+        effective_policies = resolve_policies_for_tool(tool_name, connections, policies)
+        effective_config = {**(tool_configs or {}), **resolve_config_for_tool(tool_name, connections)}
+        policy_raw = True
+    else:
+        effective_policies = merge_policies(agent_type, policies)
+        effective_config = tool_configs or {}
+        policy_raw = False
+
+    engine = PolicyEngine(
+        agent_id=agent_id or "anonymous",
+        agent_type=agent_type,
+        policies=effective_policies,
+        tool_configs=effective_config,
+        spend_state=spend_state,
+        raw_policies=policy_raw,
+    )
+    decision = engine.evaluate(tool_name, parameters, quote_snapshot, approved_ids)
+
+    if decision["decision"] == "deny":
+        if agent_id:
+            log_action(
+                agent_id, tool_name, "deny", decision.get("params_hash", ""),
+                status="denied", error_message=decision.get("reason"),
+            )
+        return {
+            "success": False,
+            "tool": tool_name,
+            "policy_decision": "deny",
+            "error": decision.get("reason", "Policy denied"),
+        }
+
+    if decision["decision"] == "pending_approval":
+        approval = None
+        if agent_id and is_configured():
+            approval = create_approval(
+                agent_id,
+                tool_name,
+                decision.get("summary", "Approval required"),
+                decision.get("payload", parameters),
+                decision.get("quote_snapshot"),
+            )
+        if not approval and agent_id:
+            try:
+                resp = requests.post(
+                    f"{BACKEND_BASE_URL}/internal/approvals",
+                    headers=_internal_headers(),
+                    json={
+                        "agentId": agent_id,
+                        "tool": tool_name,
+                        "summary": decision.get("summary"),
+                        "payload": decision.get("payload", parameters),
+                        "quote_snapshot": decision.get("quote_snapshot"),
+                    },
+                    timeout=15,
+                )
+                if resp.ok:
+                    approval = resp.json().get("approval")
+            except requests.RequestException:
+                pass
+
+        return {
+            "success": False,
+            "tool": tool_name,
+            "policy_decision": "pending_approval",
+            "approval": approval,
+            "summary": decision.get("summary"),
+            "message": "This action requires your approval before it can proceed.",
+        }
+
+    policy_context = {
+        "decision": "allow",
+        "params_hash": decision.get("params_hash"),
+        "quote_snapshot": decision.get("quote_snapshot") or quote_snapshot,
+    }
+
+    requires_wallet = tool_def.get("requires_wallet", False)
+
+    # Server-side signing path (no private key in LLM)
+    if requires_wallet and user_id and not private_key:
+        return execute_tool_via_internal(user_id, agent_id or "", tool_name, parameters, policy_context)
+
+    # Legacy / direct HTTP path
+    if requires_wallet and user_id:
+        try:
+            resp = requests.post(
+                f"{BACKEND_BASE_URL}/internal/execute-tool",
+                headers=_internal_headers(),
+                json={
+                    "userId": user_id,
+                    "agentId": agent_id,
+                    "tool": tool_name,
+                    "parameters": parameters,
+                    "policyContext": policy_context,
+                },
+                timeout=120,
+            )
+            if resp.ok:
+                data = resp.json()
+                result = data.get("result", data)
+                if agent_id:
+                    log_action(
+                        agent_id, tool_name, "allow", decision.get("params_hash", ""),
+                        status="completed",
+                        quote_snapshot=policy_context.get("quote_snapshot"),
+                        notional_usd=result.get("notional_usd"),
+                        tx_hash=result.get("swapTxHash"),
+                    )
+                return {"success": True, "tool": tool_name, "result": result}
+        except requests.RequestException:
+            pass
+
+    if private_key and requires_wallet:
+        parameters["privateKey"] = private_key
+
     endpoint = tool_def["endpoint"]
     method = tool_def["method"]
-    
-    # Handle URL parameters for GET requests
-    if "{address}" in endpoint:
-        if "address" in parameters:
-            endpoint = endpoint.replace("{address}", parameters["address"])
-            # For GET requests, remove address from parameters
-            if method == "GET":
-                parameters = {}
-    
-    # Prepare headers - check if Bearer token is needed
+
+    if "{agentId}" in endpoint and agent_id:
+        endpoint = endpoint.replace("{agentId}", agent_id)
+
+    if method == "GET" and tool_name == "get_trade_history":
+        limit = parameters.pop("limit", 10)
+        endpoint = f"{endpoint}?limit={limit}"
+
     headers = {}
-    # Note: Add backend auth headers here if your Monad API requires them
-    
     try:
         if method == "POST":
-            response = requests.post(endpoint, json=parameters, headers=headers, timeout=60)
+            response = requests.post(endpoint, json=parameters, headers=headers, timeout=120)
         elif method == "GET":
             response = requests.get(endpoint, headers=headers, timeout=60)
         else:
             raise ValueError(f"Unsupported HTTP method: {method}")
-        
+
         response.raise_for_status()
-        return {
-            "success": True,
-            "tool": tool_name,
-            "result": response.json()
-        }
-    except requests.exceptions.RequestException as e:
-        return {
-            "success": False,
-            "tool": tool_name,
-            "error": str(e)
-        }
+        result = response.json()
+
+        if agent_id:
+            log_action(
+                agent_id, tool_name, "allow", decision.get("params_hash", ""),
+                status="completed",
+                quote_snapshot=policy_context.get("quote_snapshot"),
+                notional_usd=result.get("notional_usd") or result.get("total_usd"),
+                tx_hash=result.get("swapTxHash") or result.get("transaction", {}).get("hash"),
+            )
+
+        return {"success": True, "tool": tool_name, "result": result}
+    except requests.RequestException as e:
+        if agent_id:
+            log_action(
+                agent_id, tool_name, "allow", decision.get("params_hash", ""),
+                status="failed", error_message=str(e),
+            )
+        return {"success": False, "tool": tool_name, "error": str(e)}
+
 
 def get_llm_tool_definitions(tool_names: List[str]) -> List[Dict[str, Any]]:
-    """Convert tool definitions to OpenAI-compatible function-calling format (used by Groq)."""
-    
     tools = []
     for tool_name in tool_names:
-        if tool_name in TOOL_DEFINITIONS:
-            tool_def = TOOL_DEFINITIONS[tool_name]
+        resolved = resolve_tool_name(tool_name)
+        if resolved in TOOL_DEFINITIONS:
+            tool_def = TOOL_DEFINITIONS[resolved]
             tools.append({
                 "type": "function",
                 "function": {
-                    "name": tool_def["name"],
+                    "name": resolved,
                     "description": tool_def["description"],
-                    "parameters": tool_def["parameters"]
-                }
+                    "parameters": tool_def["parameters"],
+                },
             })
-    
     return tools
+
 
 def process_agent_conversation(
     system_prompt: str,
     user_message: str,
     available_tools: List[str],
     tool_flow: Dict[str, str],
+    agent_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    wallet_address: Optional[str] = None,
+    agent_type: str = "general",
+    policies: Optional[Dict[str, Any]] = None,
+    tool_configs: Optional[Dict[str, Any]] = None,
+    tool_connections: Optional[List[ToolConnection]] = None,
     private_key: Optional[str] = None,
-    max_iterations: int = 10
+    max_iterations: int = 10,
 ) -> Dict[str, Any]:
-    """Process the conversation with the AI agent with support for sequential tool execution"""
-    
-    # Add private key context if available
-    if private_key:
-        system_prompt += f"\n\nCONTEXT: User's private key is available: {private_key}"
-    
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message}
+        {"role": "user", "content": user_message},
     ]
-    
+
     llm_tools = get_llm_tool_definitions(available_tools)
-    
     all_tool_calls = []
     all_tool_results = []
+    pending_approvals = []
     iteration = 0
-    
-    # Loop to handle sequential tool calls
+
     while iteration < max_iterations:
         iteration += 1
-        
+
         if not client:
             return {
                 "agent_response": "GROQ_API_KEY is not set. Add it to your .env file.",
                 "tool_calls": all_tool_calls,
                 "results": all_tool_results,
+                "pending_approvals": pending_approvals,
                 "conversation_history": messages,
             }
 
@@ -365,135 +421,139 @@ def process_agent_conversation(
             tool_choice="auto" if llm_tools else None,
             temperature=0.7,
         )
-        
+
         assistant_message = response.choices[0].message
-        
-        # Check if there are tool calls
+
         if not assistant_message.tool_calls:
-            # No more tool calls, return final response
             return {
                 "agent_response": assistant_message.content,
                 "tool_calls": all_tool_calls,
                 "results": all_tool_results,
-                "conversation_history": messages
+                "pending_approvals": pending_approvals,
+                "conversation_history": messages,
             }
-        
-        # Process tool calls
+
         messages.append({
             "role": "assistant",
             "content": assistant_message.content,
-            "tool_calls": assistant_message.tool_calls
+            "tool_calls": assistant_message.tool_calls,
         })
-        
+
         for tool_call in assistant_message.tool_calls:
-            function_name = tool_call.function.name
+            function_name = resolve_tool_name(tool_call.function.name)
             function_args = json.loads(tool_call.function.arguments)
-            
-            # Add private key if needed and available
-            if private_key and "privateKey" in TOOL_DEFINITIONS[function_name]["parameters"]["properties"]:
-                if "privateKey" not in function_args:
-                    function_args["privateKey"] = private_key
-            
-            all_tool_calls.append({
-                "tool": function_name,
-                "parameters": function_args
-            })
-            
-            # Execute the tool
-            result = execute_tool(function_name, function_args)
+
+            all_tool_calls.append({"tool": function_name, "parameters": function_args})
+
+            result = execute_tool(
+                function_name,
+                function_args,
+                agent_id=agent_id,
+                user_id=user_id,
+                wallet_address=wallet_address,
+                agent_type=agent_type,
+                policies=policies,
+                tool_configs=tool_configs,
+                tool_connections=tool_connections,
+                private_key=None,
+            )
             all_tool_results.append(result)
-            
-            # Add tool result to messages
+
+            if result.get("policy_decision") == "pending_approval":
+                pending_approvals.append(result)
+
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
-                "content": json.dumps(result)
+                "content": json.dumps(result),
             })
-        
-        # Check if we need to continue with sequential tools
-        # If the last tool executed has a next_tool in the flow, prompt the agent to continue
-        last_tool_executed = all_tool_calls[-1]["tool"]
-        if last_tool_executed in tool_flow:
-            next_tool = tool_flow[last_tool_executed]
-            # Add a system message to prompt continuation
+
+        last_tool = all_tool_calls[-1]["tool"]
+        if last_tool in tool_flow:
+            next_tool = tool_flow[last_tool]
             messages.append({
                 "role": "system",
-                "content": f"IMPORTANT: You must now immediately call the {next_tool} tool as it is next in the sequential flow. Do not ask for confirmation, proceed with the execution."
+                "content": f"Continue the sequence: call {next_tool} now.",
             })
-    
-    # Max iterations reached, return what we have
+
     return {
-        "agent_response": "Maximum iterations reached. Please try again with a simpler request.",
+        "agent_response": "Maximum iterations reached. Please try a simpler request.",
         "tool_calls": all_tool_calls,
         "results": all_tool_results,
-        "conversation_history": messages
+        "pending_approvals": pending_approvals,
+        "conversation_history": messages,
     }
 
-# API Endpoints
+
 @app.post("/agent/chat", response_model=AgentResponse)
 async def chat_with_agent(request: AgentRequest):
-    """
-    Main endpoint to interact with the AI agent.
-    Dynamically configures the agent based on tool connections.
-    """
-    
     if not client:
-        raise HTTPException(
-            status_code=503,
-            detail="GROQ_API_KEY is not configured. Set it in your .env file.",
-        )
+        raise HTTPException(status_code=503, detail="GROQ_API_KEY is not configured.")
 
     try:
-        # Extract unique tools and build flow map
         unique_tools = set()
         tool_flow = {}
-        
+
         for conn in request.tools:
-            unique_tools.add(conn.tool)
+            name = resolve_tool_name(conn.tool)
+            unique_tools.add(name)
             if conn.next_tool:
-                unique_tools.add(conn.next_tool)
-                tool_flow[conn.tool] = conn.next_tool
-        
+                next_name = resolve_tool_name(conn.next_tool)
+                unique_tools.add(next_name)
+                tool_flow[name] = next_name
+
         available_tools = list(unique_tools)
-        
-        # Validate tools
+
         for tool in available_tools:
             if tool not in TOOL_DEFINITIONS:
                 raise HTTPException(status_code=400, detail=f"Unknown tool: {tool}")
-        
-        # Build system prompt
-        system_prompt = build_system_prompt(request.tools)
-        
-        # Process conversation with sequential support
+
+        merged_policies = request.policies or {}
+
+        system_prompt = build_system_prompt(request.tools, request.wallet_address)
+
         result = process_agent_conversation(
             system_prompt=system_prompt,
             user_message=request.user_message,
             available_tools=available_tools,
             tool_flow=tool_flow,
-            private_key=request.private_key
+            agent_id=request.agent_id,
+            user_id=request.user_id,
+            wallet_address=request.wallet_address,
+            agent_type=request.agent_type,
+            policies=merged_policies,
+            tool_configs=request.tool_configs,
+            tool_connections=request.tools,
+            private_key=None,
         )
-        
+
+        response_text = result["agent_response"] or ""
+        if result.get("pending_approvals"):
+            summaries = [p.get("summary", "Approval required") for p in result["pending_approvals"]]
+            response_text += "\n\n⚠️ Approval required:\n" + "\n".join(f"- {s}" for s in summaries)
+
         return AgentResponse(
-            agent_response=result["agent_response"],
+            agent_response=response_text,
             tool_calls=result["tool_calls"],
-            results=result["results"]
+            results=result["results"],
+            pending_approvals=result.get("pending_approvals", []),
         )
-    
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "service": "Monad AI Agent Builder"}
+    return {"status": "healthy", "service": "Monad AI Agent Builder", "tools": len(TOOL_DEFINITIONS)}
+
 
 @app.get("/tools")
 async def list_tools():
-    """List all available tools"""
     return {
-        "tools": list(TOOL_DEFINITIONS.keys()),
-        "details": TOOL_DEFINITIONS
+        "tools": get_available_tool_names(),
+        "details": {k: {"description": v["description"], "category": v.get("category")} for k, v in TOOL_DEFINITIONS.items()},
     }
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
