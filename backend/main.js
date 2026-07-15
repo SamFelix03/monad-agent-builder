@@ -22,6 +22,9 @@ const {
 } = require('./network');
 require('dotenv').config();
 
+const { registerExtensionRoutes } = require('./routes/extensions');
+const { executeSwapFromQuote } = require('./lib/swapService');
+
 const app = express();
 app.use(express.json());
 
@@ -1633,16 +1636,29 @@ app.post('/swap', async (req, res) => {
   try {
     const {
       privateKey,
+      quoteId,
       tokenIn,
       tokenOut,
       amountIn,
       slippageTolerance = 5,
     } = req.body;
 
+    // Guarded path: execute from a prior quote_swap quoteId
+    if (quoteId) {
+      if (!privateKey) {
+        return res.status(400).json({
+          success: false,
+          error: 'privateKey required when executing swap with quoteId',
+        });
+      }
+      const result = await executeSwapFromQuote({ quoteId, slippageTolerance, privateKey });
+      return res.json(result);
+    }
+
     if (!privateKey || !tokenIn || !tokenOut || !amountIn) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: privateKey, tokenIn, tokenOut, amountIn',
+        error: 'Missing required fields: privateKey, tokenIn, tokenOut, amountIn (or quoteId)',
       });
     }
 
@@ -2489,6 +2505,58 @@ app.post('/yield', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', network: 'Monad Testnet' });
 });
+
+async function fetchTokenPriceUsd(query) {
+  const lower = String(query || '').toLowerCase();
+  let coinId = null;
+  for (const [keyword, id] of Object.entries(COINGECKO_IDS)) {
+    if (lower.includes(keyword)) {
+      coinId = id;
+      break;
+    }
+  }
+  if (!coinId) return { usd: 0 };
+  const response = await axios.get(`https://api.coingecko.com/api/v3/simple/price`, {
+    params: { ids: coinId, vs_currencies: 'usd' },
+    timeout: 15000,
+  });
+  const usd = response.data?.[coinId]?.usd || 0;
+  return { usd, coinId };
+}
+
+async function getWalletAnalytics(address) {
+  const moralisApiKey = getMoralisApiKey();
+  const provider = new ethers.JsonRpcProvider(MONAD_TESTNET_RPC);
+  const nativeWei = await provider.getBalance(address);
+  const nativeBalance = {
+    balance: ethers.formatEther(nativeWei),
+    symbol: NATIVE_SYMBOL,
+  };
+
+  if (!moralisApiKey) {
+    return { success: true, address, nativeBalance, tokens: [] };
+  }
+
+  const moralisUrl = `https://deep-index.moralis.io/api/v2.2/wallets/${address}/tokens`;
+  const response = await axios.get(moralisUrl, {
+    params: { chain: MONAD_MORALIS_CHAIN },
+    headers: { Accept: 'application/json', 'X-API-Key': moralisApiKey },
+    timeout: 30000,
+  });
+
+  const tokens = (response.data?.result || [])
+    .filter((t) => !t.possible_spam && parseFloat(t.balance_formatted || 0) > 0 && !t.native_token)
+    .map((t) => ({
+      symbol: t.symbol,
+      name: t.name,
+      balance: t.balance_formatted,
+      tokenAddress: t.token_address,
+    }));
+
+  return { success: true, address, nativeBalance, tokens };
+}
+
+registerExtensionRoutes(app, { fetchTokenPriceUsd, getWalletAnalytics });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
