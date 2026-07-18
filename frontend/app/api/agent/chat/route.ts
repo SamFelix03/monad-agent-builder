@@ -9,7 +9,7 @@ const EXTERNAL_AGENT_API_URL =
 
 export async function POST(request: Request) {
   try {
-    const { api_key, user_message } = await request.json()
+    const { api_key, user_message, conversation_history } = await request.json()
 
     if (!api_key || !user_message) {
       return NextResponse.json(
@@ -17,6 +17,19 @@ export async function POST(request: Request) {
         { status: 400 }
       )
     }
+
+    const history = Array.isArray(conversation_history)
+      ? conversation_history
+          .filter(
+            (m: { role?: string; content?: string }) =>
+              (m.role === 'user' || m.role === 'assistant') && m.content?.trim()
+          )
+          .slice(-40)
+          .map((m: { role: string; content: string }) => ({
+            role: m.role,
+            content: m.content.trim(),
+          }))
+      : []
 
     const agent = await getAgentByApiKey(api_key)
     if (!agent) {
@@ -53,6 +66,7 @@ export async function POST(request: Request) {
     const requestBody = {
       tools,
       user_message,
+      conversation_history: history,
       agent_id: agent.id,
       user_id: agent.user_id,
       wallet_address: user.wallet_address,

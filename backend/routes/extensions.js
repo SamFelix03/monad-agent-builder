@@ -38,8 +38,12 @@ function registerExtensionRoutes(app, { fetchTokenPriceUsd, getWalletAnalytics }
     const p = getProvider(provider);
 
     if (tool === 'product_search') {
-      const products = p.searchProducts(parameters.query, { maxResults: parameters.maxResults || 5 });
-      return { success: true, provider, products };
+      const products = p.searchProducts(parameters.query, {
+        maxResults: parameters.maxResults || 5,
+        maxPriceUsd: parameters.maxPriceUsd,
+        minPriceUsd: parameters.minPriceUsd,
+      });
+      return { success: true, provider: parameters.provider || 'mock', products };
     }
     if (tool === 'product_details') {
       const product = p.getProduct(parameters.productId);
@@ -243,12 +247,12 @@ function registerExtensionRoutes(app, { fetchTokenPriceUsd, getWalletAnalytics }
   // --- Approvals ---
   app.post('/internal/approvals', requireServiceAuth, async (req, res) => {
     try {
-      const { agentId, tool, summary, payload, quote_snapshot } = req.body;
-      const expires = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+      const { agentId, tool, summary, payload, quote_snapshot, expires_at } = req.body;
+      const expires = expires_at || new Date(Date.now() + 15 * 60 * 1000).toISOString();
       const approval = await createApproval({
         agent_id: agentId,
         tool,
-        summary,
+        summary: summary || 'Approval required',
         payload: payload || {},
         quote_snapshot,
         expires_at: expires,
@@ -356,9 +360,9 @@ function registerExtensionRoutes(app, { fetchTokenPriceUsd, getWalletAnalytics }
 
   app.post('/commerce/search', async (req, res) => {
     try {
-      const { query, provider = 'mock', maxResults = 5 } = req.body;
+      const { query, provider = 'mock', maxResults = 5, maxPriceUsd, minPriceUsd } = req.body;
       const p = getProvider(provider);
-      const products = p.searchProducts(query, { maxResults });
+      const products = p.searchProducts(query, { maxResults, maxPriceUsd, minPriceUsd });
       return res.json({ success: true, provider, products });
     } catch (error) {
       return res.status(400).json({ success: false, error: error.message });

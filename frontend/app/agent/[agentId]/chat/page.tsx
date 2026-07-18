@@ -3,7 +3,7 @@
 import * as React from "react"
 import { useState, useRef, useEffect } from "react"
 import { useRouter, useParams } from "next/navigation"
-import { Send, Bot, User, Loader2, CheckCircle2, XCircle, ExternalLink, ArrowLeft } from "lucide-react"
+import { Send, Bot, User, Loader2, CheckCircle2, XCircle, ExternalLink, ArrowLeft, ChevronDown } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -16,6 +16,8 @@ import { useAuth } from "@/lib/auth"
 import { Input } from "@/components/ui/input"
 import { formatToolName } from "@/lib/tool-registry"
 import { agentHasShoppingTools, getMerchantAllowlistFromTools } from "@/lib/policies"
+import { AgentMarkdown } from "@/components/agent-markdown"
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 
 interface Message {
   id: string
@@ -150,7 +152,71 @@ export default function AgentChatPage() {
     }
   }
 
-  const sendAgentMessage = async (userQuery: string) => {
+  const CONFIRM_RE =
+    /^(yes|yeah|yep|confirm|confirmed|approve|approved|go ahead|proceed|place\s*(the\s*)?order|checkout)$/i
+
+  const collectPendingApprovals = (response: AgentChatResponse) => {
+    const items: Array<{
+      approval?: { id: string }
+      summary?: string
+      tool?: string
+      payload?: Record<string, unknown>
+    }> = []
+    const seen = new Set<string>()
+
+    const add = (item: (typeof items)[0]) => {
+      const key = item.approval?.id || `${item.tool}-${item.summary}`
+      if (seen.has(key)) return
+      seen.add(key)
+      items.push(item)
+    }
+
+    for (const p of response.pending_approvals || []) {
+      const row = p as {
+        approval?: { id: string }
+        summary?: string
+        tool?: string
+        payload?: Record<string, unknown>
+      }
+      add({
+        approval: row.approval,
+        summary: row.summary,
+        tool: row.tool,
+        payload: row.payload,
+      })
+    }
+
+    for (const r of response.results.filter((x) => x.policy_decision === "pending_approval")) {
+      const toolCall = response.tool_calls?.find((tc) => tc.tool === r.tool)
+      add({
+        approval: r.approval,
+        summary: r.summary || r.message,
+        tool: r.tool,
+        payload:
+          (r as { payload?: Record<string, unknown> }).payload || toolCall?.parameters,
+      })
+    }
+
+    return items
+  }
+
+  const getLatestResolvableApproval = (msgs: Message[]) => {
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const ar = msgs[i].agentResponse
+      if (!ar) continue
+      const pending = collectPendingApprovals(ar).find((p) => p.approval?.id)
+      if (pending) return pending
+    }
+    return null
+  }
+
+  const buildConversationHistory = (msgs: Message[]) =>
+    msgs
+      .filter((m) => (m.role === "user" || m.role === "assistant") && m.content?.trim())
+      .slice(-40)
+      .map((m) => ({ role: m.role, content: m.content.trim() }))
+
+  const sendAgentMessage = async (userQuery: string, history: Message[] = []) => {
     if (!agent?.api_key) throw new Error("Agent API key not found")
 
     const response = await fetch("/api/agent/chat", {
@@ -159,6 +225,7 @@ export default function AgentChatPage() {
       body: JSON.stringify({
         api_key: agent.api_key,
         user_message: userQuery,
+        conversation_history: buildConversationHistory(history),
       }),
     })
 
@@ -226,7 +293,8 @@ export default function AgentChatPage() {
         setIsLoading(true)
         try {
           const cleaned = await sendAgentMessage(
-            `Place the order now using cartId "${context.cartId}" and approvalId "${approvalId}". Use provider mock if not specified.`
+            `Place the order now using cartId "${context.cartId}" and approvalId "${approvalId}". Use provider mock if not specified.`,
+            messages
           )
           const assistantMessage: Message = {
             id: Date.now().toString(),
@@ -263,23 +331,11 @@ export default function AgentChatPage() {
     }
   }
 
+  const hasPendingApprovals = (response: AgentChatResponse) =>
+    collectPendingApprovals(response).length > 0
+
   const renderPendingApprovals = (response: AgentChatResponse) => {
-    const pending = response.pending_approvals || []
-    const fromResults = response.results
-      .filter((r) => r.policy_decision === "pending_approval")
-      .map((r) => {
-        const toolCall = response.tool_calls?.find((tc) => tc.tool === r.tool)
-        const payload =
-          (r as { payload?: Record<string, unknown> }).payload ||
-          toolCall?.parameters
-        return {
-          approval: r.approval,
-          summary: r.summary || r.message,
-          tool: r.tool,
-          payload,
-        }
-      })
-    const all = [...pending, ...fromResults]
+    const all = collectPendingApprovals(response)
     if (all.length === 0) return null
 
     return (
@@ -294,7 +350,8 @@ export default function AgentChatPage() {
                 <CardContent className="pt-4">
                   <p className="text-sm">{item.summary || "This action requires your approval."}</p>
                   <p className="mt-2 text-xs text-muted-foreground">
-                    Approval could not be created. Check backend configuration.
+                    Approval record could not be saved to Supabase. Check service role keys and that
+                    the agent_approvals migration has been applied.
                   </p>
                 </CardContent>
               </Card>
@@ -354,26 +411,18 @@ export default function AgentChatPage() {
         throw new Error("Agent API key not found")
       }
 
-      const response = await fetch("/api/agent/chat", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          api_key: agent.api_key,
-          user_message: userQuery,
-        }),
-      })
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({ error: "Unknown error" }))
-        throw new Error(errorData.error || `Request failed with status ${response.status}`)
+      if (CONFIRM_RE.test(userQuery)) {
+        const pending = getLatestResolvableApproval(messages)
+        if (pending?.approval?.id) {
+          await handleResolveApproval(pending.approval.id, "approved", {
+            cartId: pending.payload?.cartId as string | undefined,
+            tool: pending.tool,
+          })
+          return
+        }
       }
 
-      const data: AgentChatResponse = await response.json()
-
-      // Remove privateKey/private_key fields from the response
-      const cleanedData = removePrivateKeys(data) as AgentChatResponse
+      const cleanedData = await sendAgentMessage(userQuery, messages)
 
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
@@ -408,14 +457,20 @@ export default function AgentChatPage() {
     }
   }
 
-  const renderToolResult = (result: any, tool: string) => {
-    if (!result?.result) return null
+  const renderToolResult = (result: any, tool: string, index: number) => {
+    const res = result?.result
+    const isPolicyBlock = result?.policy_decision === "pending_approval" || result?.policy_decision === "deny"
+    if (!res && !isPolicyBlock) return null
 
-    const res = result.result
-    const isSuccess = result.success && res.success
+    const isSuccess =
+      result.policy_decision !== "deny" &&
+      result.policy_decision !== "pending_approval" &&
+      result.success &&
+      (res?.success !== false)
+    const cardKey = `${tool}-${index}-${result.policy_decision || (result.success ? "ok" : "fail")}`
 
     return (
-      <Card key={`${tool}-${result.success}`} className={cn("mb-3 shadow-none", !isSuccess && "border-destructive/50")}>
+      <Card key={cardKey} className={cn("mb-3 shadow-none", !isSuccess && "border-destructive/50")}>
         <CardHeader className="pb-2">
           <div className="flex items-center justify-between gap-3">
             <CardTitle className="flex items-center gap-2 text-sm">
@@ -426,18 +481,36 @@ export default function AgentChatPage() {
               )}
               {formatToolName(tool)}
             </CardTitle>
-            <Badge variant={isSuccess ? "default" : "destructive"}>
-              {isSuccess ? "Success" : "Failed"}
+            <Badge
+              variant={
+                result.policy_decision === "pending_approval"
+                  ? "secondary"
+                  : isSuccess
+                    ? "default"
+                    : "destructive"
+              }
+            >
+              {result.policy_decision === "pending_approval"
+                ? "Awaiting approval"
+                : isSuccess
+                  ? "Success"
+                  : "Failed"}
             </Badge>
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
-          {res.message && (
+          {result.policy_decision === "deny" && (
+            <p className="text-sm text-destructive">{result.error || "Policy denied this action."}</p>
+          )}
+          {result.policy_decision === "pending_approval" && (
+            <p className="text-sm text-amber-600">{result.summary || result.message || "Approval required."}</p>
+          )}
+          {res?.message && (
             <p className="text-sm text-muted-foreground">{res.message}</p>
           )}
 
           {/* Airdrop Result */}
-          {tool === "airdrop" && res.airdrop && (
+          {res && tool === "airdrop" && res.airdrop && (
             <div className="space-y-2">
               <div className="grid grid-cols-2 gap-2 text-sm">
                 <div>
@@ -473,7 +546,7 @@ export default function AgentChatPage() {
           )}
 
           {/* Deposit Yield Result */}
-          {tool === "deposit_yield" && res.deposit && (
+          {res && tool === "deposit_yield" && res.deposit && (
             <div className="space-y-3">
               <div className="grid grid-cols-2 gap-2 text-sm">
                 <div>
@@ -510,7 +583,7 @@ export default function AgentChatPage() {
           )}
 
           {/* Transaction Info */}
-          {res.transaction && (
+          {res?.transaction && (
             <div className="pt-2 border-t">
               <div className="flex items-center justify-between">
                 <div>
@@ -538,7 +611,7 @@ export default function AgentChatPage() {
           )}
 
           {/* Balances */}
-          {res.balances && (
+          {res?.balances && (
             <div className="pt-2 border-t">
               <span className="text-muted-foreground text-xs">Balances:</span>
               <div className="grid grid-cols-2 gap-2 text-xs mt-1">
@@ -555,25 +628,29 @@ export default function AgentChatPage() {
           )}
 
           {/* Shopping: product search */}
-          {tool === "product_search" && res.products && (
+          {tool === "product_search" && res && (
             <div className="space-y-2">
-              {(res.products as Array<{ id: string; title: string; priceUsd: number; description?: string }>).map(
-                (p) => (
-                  <div key={p.id} className="surface-row flex items-start justify-between gap-3 p-3">
-                    <div>
-                      <p className="font-medium text-sm">{p.title}</p>
-                      <p className="text-xs text-muted-foreground">{p.description}</p>
-                      <p className="mt-1 font-mono text-xs text-muted-foreground">{p.id}</p>
+              {Array.isArray(res.products) && res.products.length > 0 ? (
+                (res.products as Array<{ id: string; title: string; priceUsd: number; description?: string }>).map(
+                  (p) => (
+                    <div key={p.id} className="surface-row flex items-start justify-between gap-3 p-3">
+                      <div>
+                        <p className="font-medium text-sm">{p.title}</p>
+                        <p className="text-xs text-muted-foreground">{p.description}</p>
+                        <p className="mt-1 font-mono text-xs text-muted-foreground">{p.id}</p>
+                      </div>
+                      <Badge>${p.priceUsd?.toFixed(2)}</Badge>
                     </div>
-                    <Badge>${p.priceUsd?.toFixed(2)}</Badge>
-                  </div>
+                  )
                 )
+              ) : (
+                <p className="text-sm text-muted-foreground">No products matched that search.</p>
               )}
             </div>
           )}
 
           {/* Shopping: product details */}
-          {tool === "product_details" && res.product && (
+          {res && tool === "product_details" && res.product && (
             <div className="surface-row space-y-1 p-3 text-sm">
               <p className="font-semibold">{res.product.title}</p>
               <p className="text-muted-foreground">{res.product.description}</p>
@@ -582,7 +659,7 @@ export default function AgentChatPage() {
           )}
 
           {/* Shopping: cart */}
-          {tool === "build_cart" && res.cart && (
+          {res && tool === "build_cart" && res.cart && (
             <div className="space-y-2 text-sm">
               <p className="font-mono text-xs text-muted-foreground">Cart: {res.cart.id}</p>
               {(res.cart.items || []).map((item: { title: string; quantity: number; lineTotalUsd: number }, i: number) => (
@@ -596,7 +673,7 @@ export default function AgentChatPage() {
           )}
 
           {/* Shopping: checkout quote */}
-          {tool === "checkout_quote" && (res.quote || res.total_usd != null) && (
+          {res && tool === "checkout_quote" && (res.quote || res.total_usd != null) && (
             <div className="surface-row space-y-1 p-3 text-sm">
               <p>Subtotal: ${(res.quote?.subtotalUsd ?? res.subtotalUsd)?.toFixed?.(2) ?? "—"}</p>
               <p>Tax: ${(res.quote?.taxUsd ?? res.taxUsd)?.toFixed?.(2) ?? "—"}</p>
@@ -608,7 +685,7 @@ export default function AgentChatPage() {
           )}
 
           {/* Shopping: order placed */}
-          {tool === "place_order" && res.order && (
+          {res && tool === "place_order" && res.order && (
             <div className="surface-row space-y-1 p-3 text-sm">
               <p className="font-semibold text-green-600">Order confirmed</p>
               <p>Order ID: <span className="font-mono">{res.order.id}</span></p>
@@ -618,7 +695,8 @@ export default function AgentChatPage() {
           )}
 
           {/* Generic Result Data */}
-          {!res.airdrop &&
+          {res &&
+            !res.airdrop &&
             !res.deposit &&
             !res.transaction &&
             tool !== "product_search" &&
@@ -735,41 +813,68 @@ export default function AgentChatPage() {
                   : "chat-bubble-assistant"
               )}
             >
-              <div className="whitespace-pre-wrap text-sm leading-relaxed">{message.content}</div>
-              {message.agentResponse && (
+              {message.role === "assistant" ? (
+                <AgentMarkdown
+                  content={
+                    message.content?.trim() ||
+                    (message.agentResponse?.agent_response?.trim() ?? "") ||
+                    "See the tool results below."
+                  }
+                />
+              ) : (
+                <div className="whitespace-pre-wrap text-sm leading-relaxed">{message.content}</div>
+              )}
+              {message.agentResponse &&
+                (hasPendingApprovals(message.agentResponse) ||
+                  (message.agentResponse.tool_calls?.length ?? 0) > 0 ||
+                  (message.agentResponse.results?.length ?? 0) > 0) && (
                 <div className="mt-4 space-y-4 border-t border-border/40 pt-4">
                   {renderPendingApprovals(message.agentResponse)}
 
-                  {/* Tool Calls */}
-                  {message.agentResponse.tool_calls && message.agentResponse.tool_calls.length > 0 && (
-                    <div>
-                      <h4 className="text-sm font-semibold mb-2">Tool Calls:</h4>
-                      <div className="space-y-2">
-                        {message.agentResponse.tool_calls.map((toolCall, idx) => (
-                          <Card key={idx} className="gap-3 py-4 shadow-none">
-                            <CardContent className="space-y-2">
-                              <div className="flex items-center justify-between">
-                                <Badge variant="outline">{formatToolName(toolCall.tool)}</Badge>
-                              </div>
-                              <pre className="surface-row overflow-x-auto p-3 font-mono text-xs">
-                                {JSON.stringify(toolCall.parameters, null, 2)}
-                              </pre>
-                            </CardContent>
-                          </Card>
-                        ))}
-                      </div>
-                    </div>
-                  )}
+                  {(message.agentResponse.tool_calls?.length ?? 0) > 0 ||
+                  (message.agentResponse.results?.length ?? 0) > 0 ? (
+                    <Collapsible>
+                      <CollapsibleTrigger className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground [&[data-state=open]>svg]:rotate-180">
+                        <ChevronDown className="h-3.5 w-3.5 shrink-0 transition-transform duration-200" />
+                        <span>
+                          Technical details
+                          {message.agentResponse.tool_calls?.length
+                            ? ` · ${message.agentResponse.tool_calls.length} tool call${message.agentResponse.tool_calls.length === 1 ? "" : "s"}`
+                            : ""}
+                        </span>
+                      </CollapsibleTrigger>
+                      <CollapsibleContent className="mt-3 space-y-4">
+                        {message.agentResponse.tool_calls && message.agentResponse.tool_calls.length > 0 && (
+                          <div>
+                            <h4 className="mb-2 text-sm font-semibold">Tool Calls</h4>
+                            <div className="space-y-2">
+                              {message.agentResponse.tool_calls.map((toolCall, idx) => (
+                                <Card key={idx} className="gap-3 py-4 shadow-none">
+                                  <CardContent className="space-y-2">
+                                    <div className="flex items-center justify-between">
+                                      <Badge variant="outline">{formatToolName(toolCall.tool)}</Badge>
+                                    </div>
+                                    <pre className="surface-row overflow-x-auto p-3 font-mono text-xs">
+                                      {JSON.stringify(toolCall.parameters, null, 2)}
+                                    </pre>
+                                  </CardContent>
+                                </Card>
+                              ))}
+                            </div>
+                          </div>
+                        )}
 
-                  {/* Tool Results */}
-                  {message.agentResponse.results && message.agentResponse.results.length > 0 && (
-                    <div>
-                      <h4 className="text-sm font-semibold mb-2">Execution Results:</h4>
-                      {message.agentResponse.results.map((result, idx) =>
-                        renderToolResult(result, result.tool)
-                      )}
-                    </div>
-                  )}
+                        {message.agentResponse.results && message.agentResponse.results.length > 0 && (
+                          <div>
+                            <h4 className="mb-2 text-sm font-semibold">Execution Results</h4>
+                            {message.agentResponse.results.map((result, idx) =>
+                              renderToolResult(result, result.tool, idx)
+                            )}
+                          </div>
+                        )}
+                      </CollapsibleContent>
+                    </Collapsible>
+                  ) : null}
                 </div>
               )}
               <div className="text-xs opacity-70 mt-2">

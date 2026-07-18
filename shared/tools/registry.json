@@ -350,7 +350,7 @@
       "runtime_name": "product_search",
       "workflow_builder_name": "product_search",
       "label": "Product Search",
-      "description": "Search products from a commerce provider.",
+      "description": "Search products from a commerce provider. Use maxPriceUsd/minPriceUsd for budget filters (e.g. under $50). Put product keywords in query, not price text.",
       "category": "commerce_read",
       "risk": "low",
       "endpoint": "/commerce/search",
@@ -360,9 +360,11 @@
       "llm_schema": {
         "type": "object",
         "properties": {
-          "query": { "type": "string", "description": "Search query" },
+          "query": { "type": "string", "description": "Product keywords (e.g. headphones, keyboard). Omit price words here." },
           "provider": { "type": "string", "description": "Commerce provider id (default: mock)" },
-          "maxResults": { "type": "integer", "description": "Max results (default 5)" }
+          "maxResults": { "type": "integer", "description": "Max results (default 5)" },
+          "maxPriceUsd": { "type": "number", "description": "Only products at or below this USD price" },
+          "minPriceUsd": { "type": "number", "description": "Only products at or above this USD price" }
         },
         "required": ["query"]
       }

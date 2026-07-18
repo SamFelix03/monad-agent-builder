@@ -1,8 +1,11 @@
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import os
-from dotenv import load_dotenv
 from groq import Groq
 import json
 import requests
@@ -16,8 +19,6 @@ from registry_loader import (
 )
 from policy import PolicyEngine, resolve_policies_for_tool, resolve_config_for_tool, merge_policies
 from db import fetch_spend_state, log_action, create_approval, get_approved_ids, is_configured
-
-load_dotenv()
 
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:3001").rstrip("/")
 SERVICE_SECRET = os.getenv("SERVICE_SECRET", "dev-service-secret-change-me")
@@ -54,9 +55,15 @@ class AgentPolicies(BaseModel):
     cooldown_seconds: Optional[int] = None
 
 
+class ConversationMessage(BaseModel):
+    role: str
+    content: str
+
+
 class AgentRequest(BaseModel):
     tools: List[ToolConnection]
     user_message: str
+    conversation_history: List[ConversationMessage] = Field(default_factory=list)
     agent_id: Optional[str] = None
     user_id: Optional[str] = None
     wallet_address: Optional[str] = None
@@ -91,8 +98,16 @@ def build_system_prompt(tool_connections: List[ToolConnection], wallet_address: 
 
 TRADING RULES:
 - Always call quote_swap before swap and use the returned quoteId for swap.
-- For shopping, use provider "mock" unless configured otherwise: search → build_cart → checkout_quote → ask user to confirm → place_order with approvalId and cartId.
-- When placing an order, always include cartId and approvalId (after user approves).
+
+SHOPPING RULES:
+- Use product_search with maxPriceUsd for budget queries (e.g. "under $50" → maxPriceUsd: 50, query: product type or empty).
+- Put product keywords in query; use maxPriceUsd/minPriceUsd for price filters — do not put "under 50 usd" only in query.
+- Flow: search → (optional details) → build_cart → checkout_quote → present total → wait for explicit user approval → place_order with approvalId.
+- NEVER call place_order unless the user explicitly asked to buy/purchase/checkout AND you have an approved approvalId.
+- NEVER call build_cart or checkout_quote unless the user clearly wants to proceed with a specific product.
+- After checkout_quote, summarize the total and ask the user to confirm before attempting place_order.
+- When the user confirms (yes/confirm/approve), call place_order with cartId from the quote and approvalId only after approval exists.
+- If place_order is blocked pending approval, tell the user to click **Approve & checkout** in the chat panel or reply **confirm**.
 
 AVAILABLE TOOLS:
 """
@@ -109,7 +124,10 @@ AVAILABLE TOOLS:
         system_prompt += "\n\nTOOL EXECUTION FLOW:\n"
         for tool, next_tool in tool_flow.items():
             system_prompt += f"- After {tool} completes, call {next_tool}\n"
-        system_prompt += "\nExecute sequential tools in one turn without waiting for confirmation between steps.\n"
+        system_prompt += (
+            "\nYou may chain read-only shopping steps (search, details, cart, quote) in one turn. "
+            "STOP before place_order — always get explicit user confirmation and approval first.\n"
+        )
     else:
         system_prompt += "\nAsk for required parameters before tool calls. Explain results clearly.\n"
 
@@ -118,6 +136,7 @@ IMPORTANT:
 - Never ask for or mention private keys; signing is handled server-side.
 - Respect policy denials and pending approvals; explain alternatives.
 - Provide transaction hashes and explorer links when available.
+- After running tools, always explain results clearly to the user in plain language using markdown (bullet lists for products, **bold** for prices and totals).
 """
     return system_prompt
 
@@ -135,6 +154,30 @@ def _fetch_quote_snapshot(quote_id: str) -> Optional[Dict[str, Any]]:
 COMMERCE_TOOLS = frozenset({
     "product_search", "product_details", "build_cart", "checkout_quote", "place_order",
 })
+
+# Never auto-chain into cart/checkout/purchase — user must confirm first.
+NO_AUTO_CHAIN_TOOLS = frozenset({"build_cart", "checkout_quote", "place_order"})
+
+MAX_HISTORY_MESSAGES = 40
+
+
+def _build_llm_messages(
+    system_prompt: str,
+    user_message: str,
+    conversation_history: Optional[List[Any]] = None,
+) -> List[Dict[str, str]]:
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    prior: List[Dict[str, str]] = []
+
+    for msg in conversation_history or []:
+        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
+        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+        if role in ("user", "assistant") and content and str(content).strip():
+            prior.append({"role": role, "content": str(content).strip()})
+
+    messages.extend(prior[-MAX_HISTORY_MESSAGES:])
+    messages.append({"role": "user", "content": user_message})
+    return messages
 
 
 def _inject_commerce_defaults(
@@ -301,7 +344,8 @@ def execute_tool(
 
     if decision["decision"] == "pending_approval":
         approval = None
-        if agent_id and is_configured():
+        approval_error = None
+        if agent_id:
             approval = create_approval(
                 agent_id,
                 tool_name,
@@ -309,24 +353,11 @@ def execute_tool(
                 decision.get("payload", parameters),
                 decision.get("quote_snapshot"),
             )
-        if not approval and agent_id:
-            try:
-                resp = requests.post(
-                    f"{BACKEND_BASE_URL}/internal/approvals",
-                    headers=_internal_headers(),
-                    json={
-                        "agentId": agent_id,
-                        "tool": tool_name,
-                        "summary": decision.get("summary"),
-                        "payload": decision.get("payload", parameters),
-                        "quote_snapshot": decision.get("quote_snapshot"),
-                    },
-                    timeout=15,
+            if not approval:
+                approval_error = (
+                    "Could not create approval in Supabase. "
+                    "Ensure agent_approvals migration is applied and SUPABASE_SERVICE_ROLE_KEY is set."
                 )
-                if resp.ok:
-                    approval = resp.json().get("approval")
-            except requests.RequestException:
-                pass
 
         return {
             "success": False,
@@ -335,7 +366,8 @@ def execute_tool(
             "approval": approval,
             "summary": decision.get("summary"),
             "payload": decision.get("payload", parameters),
-            "message": "This action requires your approval before it can proceed.",
+            "message": approval_error or "This action requires your approval before it can proceed.",
+            "error": approval_error,
         }
 
     policy_context = {
@@ -406,11 +438,16 @@ def execute_tool(
         result = response.json()
 
         if agent_id:
+            notional = None
+            if tool_name == "place_order":
+                notional = result.get("notional_usd") or result.get("total_usd")
+            elif tool_name == "swap":
+                notional = result.get("notional_usd")
             log_action(
                 agent_id, tool_name, "allow", decision.get("params_hash", ""),
                 status="completed",
                 quote_snapshot=policy_context.get("quote_snapshot"),
-                notional_usd=result.get("notional_usd") or result.get("total_usd"),
+                notional_usd=notional,
                 tx_hash=result.get("swapTxHash") or result.get("transaction", {}).get("hash"),
             )
 
@@ -441,6 +478,70 @@ def get_llm_tool_definitions(tool_names: List[str]) -> List[Dict[str, Any]]:
     return tools
 
 
+def _fallback_summary_from_results(tool_results: List[Dict[str, Any]]) -> str:
+    """Plain-text summary when the LLM returns no content."""
+    lines: List[str] = []
+    for entry in tool_results:
+        tool = entry.get("tool", "")
+        if entry.get("policy_decision") == "pending_approval":
+            lines.append(entry.get("summary") or "An action is waiting for your approval.")
+            continue
+        if entry.get("policy_decision") == "deny":
+            lines.append(entry.get("error") or f"{tool} was blocked by policy.")
+            continue
+        if not entry.get("success"):
+            lines.append(entry.get("error") or f"{tool} failed.")
+            continue
+        payload = entry.get("result") or {}
+        if tool == "product_search" and payload.get("products"):
+            products = payload["products"]
+            titles = ", ".join(p.get("title", "") for p in products[:3])
+            lines.append(f"Found {len(products)} product(s): {titles}.")
+        elif tool == "product_details" and payload.get("product"):
+            p = payload["product"]
+            lines.append(f"Product details: {p.get('title')} — ${p.get('priceUsd')}.")
+        elif tool == "build_cart" and payload.get("cart"):
+            cart = payload["cart"]
+            lines.append(f"Cart {cart.get('id')} created with subtotal ${cart.get('subtotalUsd')}.")
+        elif tool == "checkout_quote" and (payload.get("quote") or payload.get("total_usd")):
+            total = (payload.get("quote") or {}).get("totalUsd") or payload.get("total_usd")
+            lines.append(f"Checkout quote total: ${total}.")
+        elif tool == "place_order" and payload.get("order"):
+            order = payload["order"]
+            lines.append(f"Order {order.get('id')} placed for ${order.get('totalUsd')}.")
+        else:
+            lines.append(f"Completed {tool.replace('_', ' ')}.")
+    return "\n".join(lines) if lines else "I completed the requested actions. See details below."
+
+
+def _synthesize_agent_response(messages: List[Dict[str, Any]], tool_results: List[Dict[str, Any]]) -> str:
+    """Generate a user-facing summary after tool execution."""
+    if not client:
+        return _fallback_summary_from_results(tool_results)
+    try:
+        summary_messages = list(messages) + [{
+            "role": "user",
+            "content": (
+                "Based on the tool results above, write a concise, friendly reply to the user "
+                "(2–5 sentences). Use markdown: bullet lists for products with **bold** names and prices, "
+                "**bold** for totals. Summarize key outcomes and next steps. "
+                "If checkout needs approval, tell the user to review and approve. "
+                "Do not call any tools."
+            ),
+        }]
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=summary_messages,
+            temperature=0.5,
+        )
+        content = response.choices[0].message.content
+        if content and content.strip():
+            return content.strip()
+    except Exception:
+        pass
+    return _fallback_summary_from_results(tool_results)
+
+
 def process_agent_conversation(
     system_prompt: str,
     user_message: str,
@@ -454,12 +555,10 @@ def process_agent_conversation(
     tool_configs: Optional[Dict[str, Any]] = None,
     tool_connections: Optional[List[ToolConnection]] = None,
     private_key: Optional[str] = None,
+    conversation_history: Optional[List[Any]] = None,
     max_iterations: int = 10,
 ) -> Dict[str, Any]:
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
-    ]
+    messages = _build_llm_messages(system_prompt, user_message, conversation_history)
 
     llm_tools = get_llm_tool_definitions(available_tools)
     all_tool_calls = []
@@ -490,8 +589,11 @@ def process_agent_conversation(
         assistant_message = response.choices[0].message
 
         if not assistant_message.tool_calls:
+            content = assistant_message.content
+            if not content or not str(content).strip():
+                content = _synthesize_agent_response(messages, all_tool_results)
             return {
-                "agent_response": assistant_message.content,
+                "agent_response": content,
                 "tool_calls": all_tool_calls,
                 "results": all_tool_results,
                 "pending_approvals": pending_approvals,
@@ -536,13 +638,14 @@ def process_agent_conversation(
         last_tool = all_tool_calls[-1]["tool"]
         if last_tool in tool_flow:
             next_tool = tool_flow[last_tool]
-            messages.append({
-                "role": "system",
-                "content": f"Continue the sequence: call {next_tool} now.",
-            })
+            if next_tool not in NO_AUTO_CHAIN_TOOLS:
+                messages.append({
+                    "role": "system",
+                    "content": f"Continue the sequence: call {next_tool} now.",
+                })
 
     return {
-        "agent_response": "Maximum iterations reached. Please try a simpler request.",
+        "agent_response": _synthesize_agent_response(messages, all_tool_results),
         "tool_calls": all_tool_calls,
         "results": all_tool_results,
         "pending_approvals": pending_approvals,
@@ -580,6 +683,7 @@ async def chat_with_agent(request: AgentRequest):
         result = process_agent_conversation(
             system_prompt=system_prompt,
             user_message=request.user_message,
+            conversation_history=request.conversation_history,
             available_tools=available_tools,
             tool_flow=tool_flow,
             agent_id=request.agent_id,

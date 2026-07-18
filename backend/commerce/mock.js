@@ -50,15 +50,65 @@ const products = [
 const carts = new Map();
 const orders = new Map();
 
-function searchProducts(query, { maxResults = 5 } = {}) {
-  const q = (query || '').toLowerCase().trim();
-  const terms = q.split(/\s+/).filter(Boolean);
+function extractPriceFilters(query) {
+  const text = (query || '').trim();
+  let maxPriceUsd = null;
+  let minPriceUsd = null;
+  let cleaned = text;
+
+  const underMatch = text.match(
+    /(?:under|below|less\s+than|max(?:imum)?|up\s+to|<=?)\s*\$?\s*(\d+(?:\.\d+)?)\s*(?:usd|dollars?)?/i
+  );
+  if (underMatch) {
+    maxPriceUsd = parseFloat(underMatch[1]);
+    cleaned = cleaned.replace(underMatch[0], ' ').trim();
+  }
+
+  const overMatch = text.match(
+    /(?:over|above|more\s+than|min(?:imum)?|>=?)\s*\$?\s*(\d+(?:\.\d+)?)\s*(?:usd|dollars?)?/i
+  );
+  if (overMatch) {
+    minPriceUsd = parseFloat(overMatch[1]);
+    cleaned = cleaned.replace(overMatch[0], ' ').trim();
+  }
+
+  const rangeMatch = text.match(/\$?(\d+(?:\.\d+)?)\s*[-–]\s*\$?(\d+(?:\.\d+)?)/);
+  if (rangeMatch) {
+    minPriceUsd = parseFloat(rangeMatch[1]);
+    maxPriceUsd = parseFloat(rangeMatch[2]);
+    cleaned = cleaned.replace(rangeMatch[0], ' ').trim();
+  }
+
+  return { cleaned, maxPriceUsd, minPriceUsd };
+}
+
+const PRICE_STOP_WORDS = new Set([
+  'under', 'below', 'less', 'than', 'over', 'above', 'more', 'usd', 'dollar', 'dollars',
+  'cheap', 'affordable', 'budget', 'price', 'priced', 'cost', 'maximum', 'minimum', 'max', 'min',
+]);
+
+function searchProducts(query, { maxResults = 5, maxPriceUsd, minPriceUsd } = {}) {
+  const extracted = extractPriceFilters(query);
+  const effectiveMax = maxPriceUsd ?? extracted.maxPriceUsd;
+  const effectiveMin = minPriceUsd ?? extracted.minPriceUsd;
+
+  let searchText = extracted.cleaned || query || '';
+  searchText = searchText.replace(/\$\s*\d+(?:\.\d+)?/g, ' ').trim();
+
+  const terms = searchText
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((term) => term && !PRICE_STOP_WORDS.has(term) && !/^\d+$/.test(term));
+
   return products
     .filter((p) => {
-      const haystack = `${p.title} ${p.description} ${p.category}`.toLowerCase();
+      if (effectiveMax != null && p.priceUsd > effectiveMax) return false;
+      if (effectiveMin != null && p.priceUsd < effectiveMin) return false;
       if (!terms.length) return true;
+      const haystack = `${p.title} ${p.description} ${p.category}`.toLowerCase();
       return terms.every((term) => haystack.includes(term));
     })
+    .sort((a, b) => a.priceUsd - b.priceUsd)
     .slice(0, maxResults);
 }
 

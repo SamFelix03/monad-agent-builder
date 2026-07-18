@@ -1,0 +1,3 @@
+-- No schema changes required.
+-- Approvals and sessions are written via the Supabase service role (bypasses RLS).
+-- Run 001_agent_extensions.sql first if agent_approvals / agent_sessions are missing.
