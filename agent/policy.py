@@ -176,9 +176,12 @@ class PolicyEngine:
 
         if category == "trade_write" or tool_name == "swap":
             return self._evaluate_trade_write(tool_name, parameters, quote_snapshot, approved_action_ids)
-        if category == "commerce_write" or tool_name == "place_order":
-            return self._evaluate_commerce_write(tool_name, parameters, quote_snapshot, approved_action_ids)
-        if tool_name in ("build_cart", "checkout_quote"):
+        if (
+            category.startswith("commerce")
+            or tool_name in ("product_search", "product_details", "build_cart", "checkout_quote", "place_order")
+        ):
+            if tool_name == "place_order" or category == "commerce_write":
+                return self._evaluate_commerce_write(tool_name, parameters, quote_snapshot, approved_action_ids)
             return self._evaluate_commerce_read(tool_name, parameters, quote_snapshot)
 
         return self._allow(tool_name, parameters, quote_snapshot)
@@ -298,6 +301,45 @@ class PolicyEngine:
 
         return self._allow(tool_name, parameters, quote_snapshot)
 
+    def _effective_merchant_allowlist(self) -> List[str]:
+        allowlist = list(self.policies.get("merchant_allowlist") or ["mock"])
+        session = self.spend_state.get("active_session")
+        if session and session.get("merchant_allowlist"):
+            session_list = session["merchant_allowlist"]
+            if isinstance(session_list, str):
+                try:
+                    session_list = json.loads(session_list)
+                except json.JSONDecodeError:
+                    session_list = [session_list]
+            if session_list:
+                allowlist = [p for p in allowlist if p in session_list] or list(session_list)
+        return allowlist
+
+    def _check_shopping_budget(self, tool_name: str, parameters: Dict[str, Any], total: float) -> Optional[Dict[str, Any]]:
+        max_order = self.policies.get("max_order_usd")
+        if max_order is not None and float(total) > float(max_order):
+            return self._deny(tool_name, parameters, f"Order total ${total:.2f} exceeds max ${max_order:.2f}.")
+
+        daily_budget = self.policies.get("daily_shopping_budget_usd")
+        daily_spent = float(self.spend_state.get("daily_shopping_usd", 0))
+        if daily_budget is not None and daily_spent + float(total) > float(daily_budget):
+            return self._deny(
+                tool_name,
+                parameters,
+                f"Daily shopping budget exceeded (${daily_spent:.2f} + ${total:.2f} > ${daily_budget:.2f}).",
+            )
+
+        session = self.spend_state.get("active_session")
+        if session:
+            remaining = float(session.get("budget_usd", 0)) - float(session.get("spent_usd", 0))
+            if float(total) > remaining:
+                return self._deny(
+                    tool_name,
+                    parameters,
+                    f"Session budget remaining ${remaining:.2f} insufficient for ${total:.2f}.",
+                )
+        return None
+
     def _evaluate_commerce_read(
         self,
         tool_name: str,
@@ -305,25 +347,21 @@ class PolicyEngine:
         quote_snapshot: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         provider = parameters.get("provider", "mock")
-        allowlist = self.policies.get("merchant_allowlist", ["mock"])
+        allowlist = self._effective_merchant_allowlist()
         if allowlist and provider not in allowlist:
             return self._deny(tool_name, parameters, f"Provider '{provider}' is not on merchant allowlist.")
 
-        total = (quote_snapshot or {}).get("total_usd") or (quote_snapshot or {}).get("notional_usd")
+        total = (
+            (quote_snapshot or {}).get("total_usd")
+            or (quote_snapshot or {}).get("totalUsd")
+            or (quote_snapshot or {}).get("subtotal_usd")
+            or (quote_snapshot or {}).get("subtotalUsd")
+            or (quote_snapshot or {}).get("notional_usd")
+        )
         if total is not None:
-            max_order = self.policies.get("max_order_usd")
-            if max_order is not None and float(total) > float(max_order):
-                return self._deny(tool_name, parameters, f"Order total ${total:.2f} exceeds max ${max_order:.2f}.")
-
-            session = self.spend_state.get("active_session")
-            if session:
-                remaining = float(session.get("budget_usd", 0)) - float(session.get("spent_usd", 0))
-                if float(total) > remaining:
-                    return self._deny(
-                        tool_name,
-                        parameters,
-                        f"Session budget remaining ${remaining:.2f} insufficient for ${total:.2f}.",
-                    )
+            budget_deny = self._check_shopping_budget(tool_name, parameters, float(total))
+            if budget_deny:
+                return budget_deny
 
         return self._allow(tool_name, parameters, quote_snapshot)
 
@@ -341,7 +379,11 @@ class PolicyEngine:
         if self.policies.get("require_approval_for_checkout", True) and tool_name == "place_order":
             approval_id = parameters.get("approvalId")
             if not approval_id or approval_id not in approved_action_ids:
-                total = (quote_snapshot or {}).get("total_usd", "unknown")
+                total = (
+                    (quote_snapshot or {}).get("total_usd")
+                    or (quote_snapshot or {}).get("totalUsd")
+                    or "unknown"
+                )
                 return self._pending(
                     tool_name,
                     parameters,

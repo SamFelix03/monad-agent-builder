@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { getAgentByApiKey } from '@/lib/agents'
 import { supabase } from '@/lib/supabase'
 import { aggregateToolsPolicies, inferAgentType } from '@/lib/policies'
+import { agentRequiresWallet } from '@/lib/tool-registry'
 
 const EXTERNAL_AGENT_API_URL =
   process.env.AGENT_API_URL || 'http://localhost:8000/agent/chat'
@@ -22,6 +23,10 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Agent not found' }, { status: 404 })
     }
 
+    const tools = agent.tools || []
+    const toolNames = tools.map((t) => t.tool)
+    const needsWallet = agentRequiresWallet(toolNames)
+
     const { data: user, error: userError } = await supabase
       .from('users')
       .select('private_key, wallet_address')
@@ -35,15 +40,13 @@ export async function POST(request: Request) {
       )
     }
 
-    if (!user.private_key) {
+    if (needsWallet && !user.private_key) {
       return NextResponse.json(
         { error: 'Agent owner has no private key configured. Please contact the agent owner.' },
         { status: 400 }
       )
     }
 
-    const tools = agent.tools || []
-    const toolNames = tools.map((t) => t.tool)
     const agentType = agent.agent_type || inferAgentType(toolNames)
     const aggregatedPolicies = aggregateToolsPolicies(tools)
 

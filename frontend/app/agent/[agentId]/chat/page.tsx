@@ -15,6 +15,7 @@ import type { Agent } from "@/lib/supabase"
 import { useAuth } from "@/lib/auth"
 import { Input } from "@/components/ui/input"
 import { formatToolName } from "@/lib/tool-registry"
+import { agentHasShoppingTools, getMerchantAllowlistFromTools } from "@/lib/policies"
 
 interface Message {
   id: string
@@ -43,7 +44,17 @@ interface AgentChatResponse {
     approval?: { id: string }
     summary?: string
     tool?: string
+    payload?: Record<string, unknown>
   }>
+}
+
+interface ShoppingSession {
+  id: string
+  budget_usd: number
+  spent_usd: number
+  merchant_allowlist: string[]
+  expires_at: string
+  status: string
 }
 
 export default function AgentChatPage() {
@@ -60,6 +71,7 @@ export default function AgentChatPage() {
   const [resolvingApproval, setResolvingApproval] = useState<string | null>(null)
   const [sessionBudget, setSessionBudget] = useState("50")
   const [creatingSession, setCreatingSession] = useState(false)
+  const [activeSession, setActiveSession] = useState<ShoppingSession | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
@@ -83,6 +95,7 @@ export default function AgentChatPage() {
           return
         }
         setAgent(agentData)
+        loadActiveSession(agentData.id)
       } catch (error: any) {
         console.error("Error loading agent:", error)
         toast({
@@ -111,25 +124,74 @@ export default function AgentChatPage() {
     }
   }, [loadingAgent])
 
+  const removePrivateKeys = (obj: unknown): unknown => {
+    if (obj === null || obj === undefined) return obj
+    if (Array.isArray(obj)) return obj.map(removePrivateKeys)
+    if (typeof obj === "object") {
+      const cleaned: Record<string, unknown> = {}
+      for (const [key, value] of Object.entries(obj)) {
+        if (key === "privateKey" || key === "private_key") continue
+        cleaned[key] = removePrivateKeys(value)
+      }
+      return cleaned
+    }
+    return obj
+  }
+
+  const loadActiveSession = async (id: string) => {
+    try {
+      const response = await fetch(`/api/agent/sessions/${id}`)
+      const data = await response.json()
+      if (response.ok && data.session) {
+        setActiveSession(data.session)
+      }
+    } catch {
+      // optional
+    }
+  }
+
+  const sendAgentMessage = async (userQuery: string) => {
+    if (!agent?.api_key) throw new Error("Agent API key not found")
+
+    const response = await fetch("/api/agent/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        api_key: agent.api_key,
+        user_message: userQuery,
+      }),
+    })
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({ error: "Unknown error" }))
+      throw new Error(errorData.error || `Request failed with status ${response.status}`)
+    }
+
+    const data: AgentChatResponse = await response.json()
+    return removePrivateKeys(data) as AgentChatResponse
+  }
+
   const handleCreateShoppingSession = async () => {
     if (!agent || !user?.id) return
     setCreatingSession(true)
     try {
+      const merchantAllowlist = getMerchantAllowlistFromTools(agent.tools || [])
       const response = await fetch(`/api/agent/sessions/${agent.id}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           userId: user.id,
           budgetUsd: Number(sessionBudget) || 50,
-          merchantAllowlist: ["mock"],
+          merchantAllowlist,
           expiresInHours: 24,
         }),
       })
       const data = await response.json()
       if (!response.ok) throw new Error(data.error || "Failed to create session")
+      setActiveSession(data.session)
       toast({
         title: "Shopping session created",
-        description: `Budget: $${sessionBudget} for 24 hours`,
+        description: `Budget: $${sessionBudget} · stores: ${merchantAllowlist.join(", ")}`,
       })
     } catch (error: unknown) {
       toast({
@@ -142,7 +204,11 @@ export default function AgentChatPage() {
     }
   }
 
-  const handleResolveApproval = async (approvalId: string, status: "approved" | "rejected") => {
+  const handleResolveApproval = async (
+    approvalId: string,
+    status: "approved" | "rejected",
+    context?: { cartId?: string; tool?: string }
+  ) => {
     setResolvingApproval(approvalId)
     try {
       const response = await fetch(`/api/agent/approvals/${approvalId}/resolve`, {
@@ -154,13 +220,38 @@ export default function AgentChatPage() {
         const err = await response.json()
         throw new Error(err.error || "Failed to resolve approval")
       }
-      toast({
-        title: status === "approved" ? "Approved" : "Rejected",
-        description:
-          status === "approved"
-            ? "You can ask the agent to retry the action with the approvalId."
-            : "Action was rejected.",
-      })
+
+      if (status === "approved" && context?.cartId) {
+        toast({ title: "Approved", description: "Completing checkout..." })
+        setIsLoading(true)
+        try {
+          const cleaned = await sendAgentMessage(
+            `Place the order now using cartId "${context.cartId}" and approvalId "${approvalId}". Use provider mock if not specified.`
+          )
+          const assistantMessage: Message = {
+            id: Date.now().toString(),
+            role: "assistant",
+            content: cleaned.agent_response || "Order processed",
+            timestamp: new Date(),
+            agentResponse: cleaned,
+          }
+          setMessages((prev) => [...prev, assistantMessage])
+          if (agent) loadActiveSession(agent.id)
+        } catch (error: unknown) {
+          toast({
+            title: "Checkout failed",
+            description: error instanceof Error ? error.message : "Could not complete order",
+            variant: "destructive",
+          })
+        } finally {
+          setIsLoading(false)
+        }
+      } else {
+        toast({
+          title: status === "approved" ? "Approved" : "Rejected",
+          description: status === "approved" ? "Approval recorded." : "Action was rejected.",
+        })
+      }
     } catch (error: unknown) {
       toast({
         title: "Error",
@@ -176,11 +267,18 @@ export default function AgentChatPage() {
     const pending = response.pending_approvals || []
     const fromResults = response.results
       .filter((r) => r.policy_decision === "pending_approval")
-      .map((r) => ({
-        approval: r.approval,
-        summary: r.summary || r.message,
-        tool: r.tool,
-      }))
+      .map((r) => {
+        const toolCall = response.tool_calls?.find((tc) => tc.tool === r.tool)
+        const payload =
+          (r as { payload?: Record<string, unknown> }).payload ||
+          toolCall?.parameters
+        return {
+          approval: r.approval,
+          summary: r.summary || r.message,
+          tool: r.tool,
+          payload,
+        }
+      })
     const all = [...pending, ...fromResults]
     if (all.length === 0) return null
 
@@ -189,7 +287,19 @@ export default function AgentChatPage() {
         <h4 className="text-sm font-semibold text-amber-600 dark:text-amber-400">Pending Approval</h4>
         {all.map((item, idx) => {
           const approvalId = item.approval?.id
-          if (!approvalId) return null
+          const cartId = item.payload?.cartId as string | undefined
+          if (!approvalId) {
+            return (
+              <Card key={`pending-${idx}`} className="border-amber-500/40 shadow-none">
+                <CardContent className="pt-4">
+                  <p className="text-sm">{item.summary || "This action requires your approval."}</p>
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    Approval could not be created. Check backend configuration.
+                  </p>
+                </CardContent>
+              </Card>
+            )
+          }
           return (
             <Card key={`${approvalId}-${idx}`} className="border-amber-500/40 shadow-none">
               <CardContent className="space-y-3 pt-4">
@@ -202,9 +312,11 @@ export default function AgentChatPage() {
                     size="sm"
                     variant="brand"
                     disabled={resolvingApproval === approvalId}
-                    onClick={() => handleResolveApproval(approvalId, "approved")}
+                    onClick={() =>
+                      handleResolveApproval(approvalId, "approved", { cartId, tool: item.tool })
+                    }
                   >
-                    Approve
+                    {cartId ? "Approve & checkout" : "Approve"}
                   </Button>
                   <Button
                     size="sm"
@@ -215,9 +327,6 @@ export default function AgentChatPage() {
                     Reject
                   </Button>
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  After approving, tell the agent: &quot;Proceed with approvalId {approvalId}&quot;
-                </p>
               </CardContent>
             </Card>
           )
@@ -298,32 +407,6 @@ export default function AgentChatPage() {
       handleSend()
     }
   }
-
-  // Recursively remove privateKey/private_key fields from objects
-  const removePrivateKeys = (obj: any): any => {
-    if (obj === null || obj === undefined) {
-      return obj
-    }
-
-    if (Array.isArray(obj)) {
-      return obj.map(removePrivateKeys)
-    }
-
-    if (typeof obj === "object") {
-      const cleaned: any = {}
-      for (const [key, value] of Object.entries(obj)) {
-        // Skip privateKey and private_key fields
-        if (key === "privateKey" || key === "private_key") {
-          continue
-        }
-        cleaned[key] = removePrivateKeys(value)
-      }
-      return cleaned
-    }
-
-    return obj
-  }
-
 
   const renderToolResult = (result: any, tool: string) => {
     if (!result?.result) return null
@@ -471,8 +554,78 @@ export default function AgentChatPage() {
             </div>
           )}
 
+          {/* Shopping: product search */}
+          {tool === "product_search" && res.products && (
+            <div className="space-y-2">
+              {(res.products as Array<{ id: string; title: string; priceUsd: number; description?: string }>).map(
+                (p) => (
+                  <div key={p.id} className="surface-row flex items-start justify-between gap-3 p-3">
+                    <div>
+                      <p className="font-medium text-sm">{p.title}</p>
+                      <p className="text-xs text-muted-foreground">{p.description}</p>
+                      <p className="mt-1 font-mono text-xs text-muted-foreground">{p.id}</p>
+                    </div>
+                    <Badge>${p.priceUsd?.toFixed(2)}</Badge>
+                  </div>
+                )
+              )}
+            </div>
+          )}
+
+          {/* Shopping: product details */}
+          {tool === "product_details" && res.product && (
+            <div className="surface-row space-y-1 p-3 text-sm">
+              <p className="font-semibold">{res.product.title}</p>
+              <p className="text-muted-foreground">{res.product.description}</p>
+              <p className="font-medium">${res.product.priceUsd?.toFixed(2)}</p>
+            </div>
+          )}
+
+          {/* Shopping: cart */}
+          {tool === "build_cart" && res.cart && (
+            <div className="space-y-2 text-sm">
+              <p className="font-mono text-xs text-muted-foreground">Cart: {res.cart.id}</p>
+              {(res.cart.items || []).map((item: { title: string; quantity: number; lineTotalUsd: number }, i: number) => (
+                <div key={i} className="flex justify-between surface-row p-2">
+                  <span>{item.title} × {item.quantity}</span>
+                  <span>${item.lineTotalUsd?.toFixed(2)}</span>
+                </div>
+              ))}
+              <p className="font-semibold">Subtotal: ${res.cart.subtotalUsd?.toFixed(2)}</p>
+            </div>
+          )}
+
+          {/* Shopping: checkout quote */}
+          {tool === "checkout_quote" && (res.quote || res.total_usd != null) && (
+            <div className="surface-row space-y-1 p-3 text-sm">
+              <p>Subtotal: ${(res.quote?.subtotalUsd ?? res.subtotalUsd)?.toFixed?.(2) ?? "—"}</p>
+              <p>Tax: ${(res.quote?.taxUsd ?? res.taxUsd)?.toFixed?.(2) ?? "—"}</p>
+              <p>Shipping: ${(res.quote?.shippingUsd ?? res.shippingUsd)?.toFixed?.(2) ?? "—"}</p>
+              <p className="font-semibold text-base">
+                Total: ${(res.quote?.totalUsd ?? res.total_usd)?.toFixed?.(2) ?? "—"}
+              </p>
+            </div>
+          )}
+
+          {/* Shopping: order placed */}
+          {tool === "place_order" && res.order && (
+            <div className="surface-row space-y-1 p-3 text-sm">
+              <p className="font-semibold text-green-600">Order confirmed</p>
+              <p>Order ID: <span className="font-mono">{res.order.id}</span></p>
+              <p>Total: ${res.order.totalUsd?.toFixed(2)}</p>
+              <p className="text-muted-foreground">Status: {res.order.status}</p>
+            </div>
+          )}
+
           {/* Generic Result Data */}
-          {!res.airdrop && !res.deposit && !res.transaction && (
+          {!res.airdrop &&
+            !res.deposit &&
+            !res.transaction &&
+            tool !== "product_search" &&
+            tool !== "product_details" &&
+            tool !== "build_cart" &&
+            tool !== "checkout_quote" &&
+            tool !== "place_order" && (
             <div className="text-xs">
               <pre className="surface-row overflow-x-auto p-3 text-xs">
                 {JSON.stringify(res, null, 2)}
@@ -517,23 +670,31 @@ export default function AgentChatPage() {
               <h1 className="text-lg font-semibold tracking-tight">{agent.name}</h1>
             </div>
           </div>
-          {(agent.agent_type === "shopping" || agent.agent_type === "hybrid") && (
-            <div className="ml-auto flex items-center gap-2">
-              <Input
-                type="number"
-                className="h-8 w-20"
-                value={sessionBudget}
-                onChange={(e) => setSessionBudget(e.target.value)}
-                aria-label="Session budget USD"
-              />
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={creatingSession}
-                onClick={handleCreateShoppingSession}
-              >
-                {creatingSession ? "..." : "Start shop session"}
-              </Button>
+          {agent && agentHasShoppingTools(agent.tools || []) && (
+            <div className="ml-auto flex flex-col items-end gap-1">
+              {activeSession && (
+                <p className="text-xs text-muted-foreground">
+                  Session: ${Number(activeSession.spent_usd || 0).toFixed(2)} / $
+                  {Number(activeSession.budget_usd).toFixed(2)} spent
+                </p>
+              )}
+              <div className="flex items-center gap-2">
+                <Input
+                  type="number"
+                  className="h-8 w-20"
+                  value={sessionBudget}
+                  onChange={(e) => setSessionBudget(e.target.value)}
+                  aria-label="Session budget USD"
+                />
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={creatingSession}
+                  onClick={handleCreateShoppingSession}
+                >
+                  {creatingSession ? "..." : activeSession ? "New session" : "Start shop session"}
+                </Button>
+              </div>
             </div>
           )}
         </div>

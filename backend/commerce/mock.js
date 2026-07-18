@@ -51,14 +51,14 @@ const carts = new Map();
 const orders = new Map();
 
 function searchProducts(query, { maxResults = 5 } = {}) {
-  const q = (query || '').toLowerCase();
+  const q = (query || '').toLowerCase().trim();
+  const terms = q.split(/\s+/).filter(Boolean);
   return products
-    .filter(
-      (p) =>
-        p.title.toLowerCase().includes(q) ||
-        p.description.toLowerCase().includes(q) ||
-        p.category.includes(q)
-    )
+    .filter((p) => {
+      const haystack = `${p.title} ${p.description} ${p.category}`.toLowerCase();
+      if (!terms.length) return true;
+      return terms.every((term) => haystack.includes(term));
+    })
     .slice(0, maxResults);
 }
 
@@ -132,6 +132,8 @@ function placeOrder(cartId) {
 
 module.exports = {
   id: 'mock',
+  label: 'Mock Store',
+  description: 'Local demo catalog for development and testing',
   searchProducts,
   getProduct,
   createCart,

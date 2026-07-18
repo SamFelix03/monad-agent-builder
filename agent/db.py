@@ -9,6 +9,7 @@ import requests
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:3001").rstrip("/")
 
 
 def _headers() -> Dict[str, str]:
@@ -26,8 +27,20 @@ def is_configured() -> bool:
 
 def fetch_spend_state(agent_id: str) -> Dict[str, Any]:
     """Aggregate daily spend from agent_actions for policy checks."""
+    default = {"daily_spend_usd": 0.0, "daily_shopping_usd": 0.0, "last_swap_at": 0.0, "active_session": None}
+
     if not is_configured():
-        return {"daily_spend_usd": 0.0, "daily_shopping_usd": 0.0, "last_swap_at": 0.0, "active_session": None}
+        try:
+            resp = requests.get(
+                f"{BACKEND_BASE_URL}/agents/{agent_id}/sessions/active",
+                timeout=10,
+            )
+            if resp.ok:
+                session = resp.json().get("session")
+                return {**default, "active_session": session}
+        except Exception:
+            pass
+        return default
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
@@ -161,16 +174,36 @@ def create_approval(
 
 def get_approved_ids(agent_id: str) -> List[str]:
     if not is_configured():
+        try:
+            resp = requests.get(
+                f"{BACKEND_BASE_URL}/agents/{agent_id}/approvals/approved",
+                timeout=10,
+            )
+            if resp.ok:
+                return resp.json().get("ids", [])
+        except Exception:
+            pass
         return []
     try:
+        now = datetime.now(timezone.utc).isoformat()
         url = (
             f"{SUPABASE_URL}/rest/v1/agent_approvals"
             f"?agent_id=eq.{agent_id}"
             f"&status=eq.approved"
+            f"&expires_at=gt.{now}"
             f"&select=id"
         )
         resp = requests.get(url, headers=_headers(), timeout=10)
         resp.raise_for_status()
         return [r["id"] for r in resp.json()]
     except Exception:
+        try:
+            resp = requests.get(
+                f"{BACKEND_BASE_URL}/agents/{agent_id}/approvals/approved",
+                timeout=10,
+            )
+            if resp.ok:
+                return resp.json().get("ids", [])
+        except Exception:
+            pass
         return []

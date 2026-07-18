@@ -2089,7 +2089,7 @@ app.post('/token-price', async (req, res) => {
     }
 
     const completion = await groqClient.chat.completions.create({
-      model: process.env.GROQ_PRICE_MODEL || 'openai/gpt-oss-20b',
+      model: process.env.GROQ_PRICE_MODEL || 'openai/gpt-oss-120b',
       messages: [
         { role: 'system', content: PRICE_SYSTEM_PROMPT },
         { role: 'user', content: query }
@@ -2107,7 +2107,7 @@ app.post('/token-price', async (req, res) => {
       query: query,
       response: responseText,
       timestamp: new Date().toISOString(),
-      model_used: process.env.GROQ_PRICE_MODEL || 'openai/gpt-oss-20b',
+      model_used: process.env.GROQ_PRICE_MODEL || 'openai/gpt-oss-120b',
       ...(Array.isArray(message.executed_tools) && message.executed_tools.length > 0
         ? { executed_tools: message.executed_tools }
         : {})
@@ -2558,7 +2558,7 @@ async function getWalletAnalytics(address) {
 
 registerExtensionRoutes(app, { fetchTokenPriceUsd, getWalletAnalytics });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Network: Monad Testnet`);

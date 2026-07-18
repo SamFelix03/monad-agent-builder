@@ -19,9 +19,9 @@ from db import fetch_spend_state, log_action, create_approval, get_approved_ids,
 
 load_dotenv()
 
-BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:3000").rstrip("/")
+BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:3001").rstrip("/")
 SERVICE_SECRET = os.getenv("SERVICE_SECRET", "dev-service-secret-change-me")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 _groq_key = os.getenv("GROQ_API_KEY")
 client: Optional[Groq] = Groq(api_key=_groq_key) if _groq_key else None
 
@@ -91,7 +91,8 @@ def build_system_prompt(tool_connections: List[ToolConnection], wallet_address: 
 
 TRADING RULES:
 - Always call quote_swap before swap and use the returned quoteId for swap.
-- For shopping, search → build_cart → checkout_quote → ask user to confirm → place_order with approvalId.
+- For shopping, use provider "mock" unless configured otherwise: search → build_cart → checkout_quote → ask user to confirm → place_order with approvalId and cartId.
+- When placing an order, always include cartId and approvalId (after user approves).
 
 AVAILABLE TOOLS:
 """
@@ -126,6 +127,67 @@ def _fetch_quote_snapshot(quote_id: str) -> Optional[Dict[str, Any]]:
         resp = requests.get(f"{BACKEND_BASE_URL}/quotes/{quote_id}", timeout=10)
         if resp.ok:
             return resp.json().get("quote")
+    except requests.RequestException:
+        pass
+    return None
+
+
+COMMERCE_TOOLS = frozenset({
+    "product_search", "product_details", "build_cart", "checkout_quote", "place_order",
+})
+
+
+def _inject_commerce_defaults(
+    tool_name: str,
+    parameters: Dict[str, Any],
+    effective_policies: Dict[str, Any],
+    effective_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    if tool_name not in COMMERCE_TOOLS:
+        return parameters
+    params = dict(parameters)
+    if not params.get("provider"):
+        params["provider"] = effective_config.get("provider")
+    if not params.get("provider"):
+        allowlist = effective_policies.get("merchant_allowlist") or ["mock"]
+        params["provider"] = allowlist[0] if allowlist else "mock"
+    return params
+
+
+def _fetch_commerce_snapshot(tool_name: str, parameters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    provider = parameters.get("provider", "mock")
+    cart_id = parameters.get("cartId")
+
+    try:
+        if tool_name in ("checkout_quote", "place_order") and cart_id:
+            resp = requests.post(
+                f"{BACKEND_BASE_URL}/commerce/checkout-quote",
+                json={"cartId": cart_id, "provider": provider},
+                timeout=10,
+            )
+            if resp.ok:
+                data = resp.json()
+                quote = data.get("quote") or data
+                total = quote.get("totalUsd") or data.get("total_usd")
+                return {**quote, "cartId": cart_id, "total_usd": total, "notional_usd": total}
+
+        if tool_name == "build_cart" and parameters.get("items"):
+            subtotal = 0.0
+            for item in parameters.get("items", []):
+                product_id = item.get("productId")
+                if not product_id:
+                    continue
+                resp = requests.post(
+                    f"{BACKEND_BASE_URL}/commerce/product",
+                    json={"productId": product_id, "provider": provider},
+                    timeout=10,
+                )
+                if resp.ok:
+                    product = resp.json().get("product", {})
+                    qty = float(item.get("quantity") or 1)
+                    subtotal += float(product.get("priceUsd") or 0) * qty
+            if subtotal > 0:
+                return {"subtotal_usd": subtotal, "total_usd": subtotal, "notional_usd": subtotal}
     except requests.RequestException:
         pass
     return None
@@ -193,15 +255,6 @@ def execute_tool(
         parameters.setdefault("agentId", agent_id)
 
     tool_def = TOOL_DEFINITIONS[tool_name]
-    quote_snapshot = None
-    if tool_name == "swap" and parameters.get("quoteId"):
-        quote_snapshot = _fetch_quote_snapshot(parameters["quoteId"])
-    elif tool_name == "checkout_quote" and parameters.get("cartId"):
-        quote_snapshot = {"cartId": parameters["cartId"]}
-
-    spend_state = fetch_spend_state(agent_id) if agent_id else {}
-    approved_ids = get_approved_ids(agent_id) if agent_id else []
-
     connections = tool_connections or []
     if connections:
         effective_policies = resolve_policies_for_tool(tool_name, connections, policies)
@@ -211,6 +264,17 @@ def execute_tool(
         effective_policies = merge_policies(agent_type, policies)
         effective_config = tool_configs or {}
         policy_raw = False
+
+    parameters = _inject_commerce_defaults(tool_name, parameters, effective_policies, effective_config)
+
+    quote_snapshot = None
+    if tool_name == "swap" and parameters.get("quoteId"):
+        quote_snapshot = _fetch_quote_snapshot(parameters["quoteId"])
+    elif tool_name in COMMERCE_TOOLS:
+        quote_snapshot = _fetch_commerce_snapshot(tool_name, parameters)
+
+    spend_state = fetch_spend_state(agent_id) if agent_id else {}
+    approved_ids = get_approved_ids(agent_id) if agent_id else []
 
     engine = PolicyEngine(
         agent_id=agent_id or "anonymous",
@@ -270,6 +334,7 @@ def execute_tool(
             "policy_decision": "pending_approval",
             "approval": approval,
             "summary": decision.get("summary"),
+            "payload": decision.get("payload", parameters),
             "message": "This action requires your approval before it can proceed.",
         }
 

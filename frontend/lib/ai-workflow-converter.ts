@@ -17,6 +17,12 @@ interface AIResponse {
   raw_response?: string
 }
 
+export function isValidAIWorkflowResponse(data: unknown): data is AIResponse {
+  if (!data || typeof data !== 'object') return false
+  const r = data as Partial<AIResponse>
+  return Array.isArray(r.tools) && typeof r.description === 'string'
+}
+
 export function aiResponseToWorkflow(aiResponse: AIResponse): { nodes: Node[]; edges: Edge[] } {
   const nodes: Node[] = []
   const edges: Edge[] = []

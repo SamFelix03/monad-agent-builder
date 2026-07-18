@@ -1,5 +1,6 @@
 "use client"
 
+import { useEffect, useState } from "react"
 import { X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
@@ -20,9 +21,16 @@ import {
   getToolCategory,
   getToolRisk,
   getToolByName,
+  isCommerceTool,
 } from "@/lib/tool-registry"
 import { getPolicyFieldsForTool, getDefaultPoliciesForTool } from "@/lib/policies"
 import { getToolNodeColors, ToolIcon } from "@/lib/tool-ui"
+
+interface CommerceProvider {
+  id: string
+  label: string
+  description?: string
+}
 
 interface NodeConfigPanelProps {
   node: WorkflowNode
@@ -49,11 +57,30 @@ export default function NodeConfigPanel({ node, updateNodeData, onClose }: NodeC
   const category = getToolCategory(toolType)
   const risk = getToolRisk(toolType)
   const policyFields = getPolicyFieldsForTool(toolType)
+  const isCommerce = isCommerceTool(toolType)
+
+  const [providers, setProviders] = useState<CommerceProvider[]>([
+    { id: "mock", label: "Mock Store", description: "Local demo catalog" },
+  ])
+
+  useEffect(() => {
+    if (!isCommerce) return
+    fetch("/api/commerce/providers")
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.providers?.length) setProviders(data.providers)
+      })
+      .catch(() => {})
+  }, [isCommerce])
 
   const policies: AgentPolicies = {
     ...getDefaultPoliciesForTool(toolType),
     ...(node.data.policies as AgentPolicies | undefined),
   }
+
+  const config = (node.data.config as Record<string, unknown> | undefined) || {}
+  const selectedProvider =
+    (config.provider as string) || policies.merchant_allowlist?.[0] || "mock"
 
   const setPolicy = (key: keyof AgentPolicies, value: unknown) => {
     updateNodeData(node.id, {
@@ -61,8 +88,19 @@ export default function NodeConfigPanel({ node, updateNodeData, onClose }: NodeC
     })
   }
 
+  const setProvider = (providerId: string) => {
+    updateNodeData(node.id, {
+      config: { ...config, provider: providerId },
+      policies: { ...policies, merchant_allowlist: [providerId] },
+    })
+  }
+
   const resetPolicies = () => {
-    updateNodeData(node.id, { policies: getDefaultPoliciesForTool(toolType) })
+    const defaults = getDefaultPoliciesForTool(toolType)
+    updateNodeData(node.id, {
+      policies: defaults,
+      config: { ...config, provider: defaults.merchant_allowlist?.[0] || "mock" },
+    })
   }
 
   return (
@@ -102,6 +140,28 @@ export default function NodeConfigPanel({ node, updateNodeData, onClose }: NodeC
           </Badge>
         </div>
 
+        {isCommerce && (
+          <div className="space-y-2 border-t border-border/50 pt-4">
+            <Label>Store / Provider</Label>
+            <Select value={selectedProvider} onValueChange={setProvider}>
+              <SelectTrigger className="h-9">
+                <SelectValue placeholder="Select provider" />
+              </SelectTrigger>
+              <SelectContent>
+                {providers.map((p) => (
+                  <SelectItem key={p.id} value={p.id}>
+                    {p.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              {providers.find((p) => p.id === selectedProvider)?.description ||
+                "Products are fetched from this commerce provider."}
+            </p>
+          </div>
+        )}
+
         {policyFields.length > 0 && (
           <div className="space-y-3 border-t border-border/50 pt-4">
             <div className="flex items-center justify-between">
@@ -111,52 +171,54 @@ export default function NodeConfigPanel({ node, updateNodeData, onClose }: NodeC
               </Button>
             </div>
             <div className="space-y-3">
-              {policyFields.map((field) => (
-                <div key={field.key} className="space-y-1">
-                  <Label className="text-xs text-muted-foreground">{field.label}</Label>
-                  {field.type === "boolean" ? (
-                    <Select
-                      value={String(policies[field.key] ?? false)}
-                      onValueChange={(v) => setPolicy(field.key, v === "true")}
-                    >
-                      <SelectTrigger className="h-9">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="false">No</SelectItem>
-                        <SelectItem value="true">Yes</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  ) : field.type === "string_list" ? (
-                    <Input
-                      className="h-9"
-                      placeholder={field.placeholder || "mock, amazon"}
-                      value={(policies[field.key] as string[] | undefined)?.join(", ") || ""}
-                      onChange={(e) => {
-                        const list = e.target.value
-                          .split(",")
-                          .map((s) => s.trim())
-                          .filter(Boolean)
-                        setPolicy(field.key, list.length ? list : undefined)
-                      }}
-                    />
-                  ) : (
-                    <Input
-                      type="number"
-                      className="h-9"
-                      value={policies[field.key] != null ? String(policies[field.key]) : ""}
-                      onChange={(e) =>
-                        setPolicy(field.key, e.target.value ? Number(e.target.value) : undefined)
-                      }
-                    />
-                  )}
-                </div>
-              ))}
+              {policyFields
+                .filter((field) => field.key !== "merchant_allowlist" || !isCommerce)
+                .map((field) => (
+                  <div key={field.key} className="space-y-1">
+                    <Label className="text-xs text-muted-foreground">{field.label}</Label>
+                    {field.type === "boolean" ? (
+                      <Select
+                        value={String(policies[field.key] ?? false)}
+                        onValueChange={(v) => setPolicy(field.key, v === "true")}
+                      >
+                        <SelectTrigger className="h-9">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="false">No</SelectItem>
+                          <SelectItem value="true">Yes</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    ) : field.type === "string_list" ? (
+                      <Input
+                        className="h-9"
+                        placeholder={field.placeholder || "mock"}
+                        value={(policies[field.key] as string[] | undefined)?.join(", ") || ""}
+                        onChange={(e) => {
+                          const list = e.target.value
+                            .split(",")
+                            .map((s) => s.trim())
+                            .filter(Boolean)
+                          setPolicy(field.key, list.length ? list : undefined)
+                        }}
+                      />
+                    ) : (
+                      <Input
+                        type="number"
+                        className="h-9"
+                        value={policies[field.key] != null ? String(policies[field.key]) : ""}
+                        onChange={(e) =>
+                          setPolicy(field.key, e.target.value ? Number(e.target.value) : undefined)
+                        }
+                      />
+                    )}
+                  </div>
+                ))}
             </div>
           </div>
         )}
 
-        {policyFields.length === 0 && (
+        {policyFields.length === 0 && !isCommerce && (
           <p className="text-xs text-muted-foreground">
             This read-only tool has no spend guardrails. Add write tools to configure limits.
           </p>

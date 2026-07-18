@@ -45,6 +45,11 @@ export function buildTemplateWorkflow(
       position: { x: 280, y: 80 + index * 120 },
     })
     node.data.policies = mergePolicyLayers(getDefaultPoliciesForTool(step.tool), stepPolicies)
+    const provider =
+      (typeof stepPolicies === 'object' && stepPolicies.merchant_allowlist?.[0]) ||
+      getDefaultPoliciesForTool(step.tool).merchant_allowlist?.[0] ||
+      'mock'
+    node.data.config = { provider }
     nodes.push(node)
 
     if (index > 0) {

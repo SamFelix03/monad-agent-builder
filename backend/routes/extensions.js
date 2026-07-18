@@ -1,4 +1,4 @@
-const { getProvider } = require('../commerce/registry');
+const { getProvider, listProviders } = require('../commerce/registry');
 const { buildSwapQuote, executeSwapFromQuote } = require('../lib/swapService');
 const {
   logAction,
@@ -7,6 +7,7 @@ const {
   createApproval,
   getApproval,
   resolveApproval,
+  getApprovedIds,
   createSession,
   getActiveSession,
   incrementSessionSpend,
@@ -24,6 +25,42 @@ function requireServiceAuth(req, res, next) {
 }
 
 function registerExtensionRoutes(app, { fetchTokenPriceUsd, getWalletAnalytics }) {
+  const commerceTools = new Set([
+    'product_search',
+    'product_details',
+    'build_cart',
+    'checkout_quote',
+    'place_order',
+  ]);
+
+  async function executeCommerceTool(tool, parameters) {
+    const provider = parameters.provider || 'mock';
+    const p = getProvider(provider);
+
+    if (tool === 'product_search') {
+      const products = p.searchProducts(parameters.query, { maxResults: parameters.maxResults || 5 });
+      return { success: true, provider, products };
+    }
+    if (tool === 'product_details') {
+      const product = p.getProduct(parameters.productId);
+      if (!product) throw new Error('Product not found');
+      return { success: true, product };
+    }
+    if (tool === 'build_cart') {
+      const cart = p.createCart(parameters.items, provider);
+      return { success: true, cart };
+    }
+    if (tool === 'checkout_quote') {
+      const quote = p.getCheckoutQuote(parameters.cartId);
+      return { success: true, quote, total_usd: quote.totalUsd };
+    }
+    if (tool === 'place_order') {
+      const order = p.placeOrder(parameters.cartId);
+      return { success: true, order };
+    }
+    throw new Error(`Unknown commerce tool: ${tool}`);
+  }
+
   // --- Quote swap (no execution) ---
   app.post('/quote-swap', async (req, res) => {
     try {
@@ -171,10 +208,12 @@ function registerExtensionRoutes(app, { fetchTokenPriceUsd, getWalletAnalytics }
           nativeBalance: analytics?.nativeBalance,
           totalEstimatedUsd: Math.round(totalUsd * 100) / 100,
         };
+      } else if (commerceTools.has(tool)) {
+        result = await executeCommerceTool(tool, params);
       } else if (toolRoutes[tool]) {
         const route = toolRoutes[tool];
         const axios = require('axios');
-        const port = process.env.PORT || 3000;
+        const port = process.env.PORT || 3001;
         const base = `http://127.0.0.1:${port}`;
         const httpResp = await axios.post(`${base}${route.path}`, params, { timeout: 120000 });
         result = httpResp.data;
@@ -245,6 +284,15 @@ function registerExtensionRoutes(app, { fetchTokenPriceUsd, getWalletAnalytics }
     }
   });
 
+  app.get('/agents/:agentId/approvals/approved', async (req, res) => {
+    try {
+      const ids = await getApprovedIds(req.params.agentId);
+      return res.json({ success: true, ids });
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
   // --- Spend sessions ---
   app.post('/agents/:agentId/sessions', async (req, res) => {
     try {
@@ -278,6 +326,34 @@ function registerExtensionRoutes(app, { fetchTokenPriceUsd, getWalletAnalytics }
   });
 
   // --- Commerce ---
+  app.get('/commerce/providers', (_req, res) => {
+    try {
+      const providers = listProviders().map((id) => {
+        const p = getProvider(id);
+        return {
+          id,
+          label: p.label || id,
+          description: p.description || '',
+        };
+      });
+      return res.json({ success: true, providers });
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  app.get('/commerce/cart/:cartId', async (req, res) => {
+    try {
+      const { provider = 'mock' } = req.query;
+      const p = getProvider(String(provider));
+      const cart = p.getCart(req.params.cartId);
+      if (!cart) return res.status(404).json({ success: false, error: 'Cart not found' });
+      return res.json({ success: true, cart });
+    } catch (error) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+  });
+
   app.post('/commerce/search', async (req, res) => {
     try {
       const { query, provider = 'mock', maxResults = 5 } = req.body;
@@ -345,9 +421,23 @@ function registerExtensionRoutes(app, { fetchTokenPriceUsd, getWalletAnalytics }
 
   app.post('/commerce/place-order', async (req, res) => {
     try {
-      const { cartId, approvalId, provider = 'mock', agentId } = req.body;
+      const { cartId, approvalId, provider = 'mock', agentId, requireApproval = true } = req.body;
 
-      if (approvalId) {
+      if (agentId && requireApproval !== false) {
+        if (!approvalId) {
+          return res.status(403).json({
+            success: false,
+            error: 'approvalId is required to place an order for an agent',
+          });
+        }
+        const approval = await getApproval(approvalId);
+        if (!approval || approval.status !== 'approved') {
+          return res.status(403).json({
+            success: false,
+            error: 'Valid approved approvalId required for place_order',
+          });
+        }
+      } else if (approvalId) {
         const approval = await getApproval(approvalId);
         if (!approval || approval.status !== 'approved') {
           return res.status(403).json({

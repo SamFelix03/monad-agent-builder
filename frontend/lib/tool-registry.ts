@@ -109,6 +109,20 @@ export function getToolRisk(type: string): string {
   return getToolByName(type)?.risk ?? 'low'
 }
 
+export function toolRequiresWallet(type: string): boolean {
+  const meta = getToolByName(type) as { requires_wallet?: boolean } | undefined
+  return Boolean(meta?.requires_wallet)
+}
+
+export function agentRequiresWallet(toolNames: string[]): boolean {
+  return toolNames.some((t) => toolRequiresWallet(t))
+}
+
+export function isCommerceTool(type: string): boolean {
+  const cat = getToolCategory(type)
+  return cat.startsWith('commerce')
+}
+
 export function formatToolName(type: string): string {
   return resolveToolName(type)
     .split('_')

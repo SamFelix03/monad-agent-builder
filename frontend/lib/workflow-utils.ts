@@ -3,6 +3,14 @@ import type { NodeData } from './types'
 import { getToolByName, getToolDescription, getToolLabel } from './tool-registry'
 import { getDefaultPoliciesForTool } from './policies'
 
+const COMMERCE_TOOLS = new Set([
+  'product_search',
+  'product_details',
+  'build_cart',
+  'checkout_quote',
+  'place_order',
+])
+
 let toolIdCounter = 0
 
 export const generateNodeId = (type: string): string => {
@@ -27,7 +35,9 @@ export const createNode = ({
       label: getDefaultLabel(type),
       description: getDefaultDescription(type),
       policies: getDefaultPoliciesForTool(type),
-      config: {},
+      config: COMMERCE_TOOLS.has(type)
+        ? { provider: getDefaultPoliciesForTool(type).merchant_allowlist?.[0] || 'mock' }
+        : {},
     },
   }
 }

@@ -149,3 +149,28 @@ export function getConfigForToolExecution(
   const matching = tools.filter((t) => t.tool === toolName)
   return Object.assign({}, ...matching.map((m) => m.config || {}))
 }
+
+/** Union of merchant providers allowed across shopping tool nodes. */
+export function getMerchantAllowlistFromTools(tools: ToolConnection[]): string[] {
+  const shoppingTools = tools.filter((t) =>
+    ['product_search', 'product_details', 'build_cart', 'checkout_quote', 'place_order'].includes(t.tool)
+  )
+  const lists = shoppingTools
+    .map((t) => t.policies?.merchant_allowlist)
+    .filter((a): a is string[] => Array.isArray(a) && a.length > 0)
+
+  if (!lists.length) {
+    const fromConfig = shoppingTools
+      .map((t) => t.config?.provider as string | undefined)
+      .filter((p): p is string => Boolean(p))
+    return fromConfig.length ? [...new Set(fromConfig)] : ['mock']
+  }
+
+  return lists.reduce((acc, list) => acc.filter((m) => list.includes(m)))
+}
+
+export function agentHasShoppingTools(tools: ToolConnection[]): boolean {
+  return tools.some((t) =>
+    ['product_search', 'product_details', 'build_cart', 'checkout_quote', 'place_order'].includes(t.tool)
+  )
+}
