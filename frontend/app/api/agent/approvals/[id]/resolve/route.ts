@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { supabase } from '@/lib/supabase'
 
-const BACKEND_URL = process.env.BACKEND_API_URL || 'http://localhost:3001'
+const BACKEND_URL = process.env.BACKEND_API_URL || 'https://monad-backend-production.up.railway.app'
 
 export async function POST(
   request: Request,

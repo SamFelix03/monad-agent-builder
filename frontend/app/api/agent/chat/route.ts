@@ -5,7 +5,7 @@ import { aggregateToolsPolicies, inferAgentType } from '@/lib/policies'
 import { agentRequiresWallet } from '@/lib/tool-registry'
 
 const EXTERNAL_AGENT_API_URL =
-  process.env.AGENT_API_URL || 'http://localhost:8000/agent/chat'
+  process.env.AGENT_API_URL || 'https://monad-agent-production.up.railway.app/agent/chat'
 
 export async function POST(request: Request) {
   try {
