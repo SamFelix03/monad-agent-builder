@@ -2,7 +2,7 @@
 
 ## Introduction
 
-**Monad No-Code Agent Builder** is a no-code platform for building, deploying, and chatting with **AI-powered agents** that perform real actions on **Monad Testnet** — plus a **mock commerce** layer for guarded shopping demos.
+**Monad No-Code Agent Builder** is a no-code platform for building, deploying, and chatting with **AI-powered agents** that perform real actions on **Monad Testnet**
 
 Users compose agents visually (drag-and-drop), from **quick-start templates**, or via **natural-language AI workflow generation**. Each tool node can carry **per-node guardrails** (budgets, allowlists, approvals). Agents are saved to **Supabase**, exposed via **API keys**, and chatted with in a rich UI or external HTTP clients.
 
