@@ -1,0 +1,469 @@
+{
+  "version": "1.0.0",
+  "aliases": {
+    "stt_balance_fetch": "get_balance",
+    "mon_balance_fetch": "get_balance",
+    "xtz_balance_fetch": "get_balance",
+    "fetch_token_price": "fetch_price",
+    "deposit_with_yield_prediction": "deposit_yield"
+  },
+  "default_policies": {
+    "general": {},
+    "trading": {
+      "max_trade_notional_usd": 25,
+      "daily_spend_budget_usd": 100,
+      "approval_threshold_usd": 10,
+      "max_slippage_bps": 100,
+      "cooldown_seconds": 60,
+      "allowed_tokens": ["native", "0xFb8bf4c1CC7a94c73D209a149eA2AbEa852BC541"],
+      "require_quote_before_swap": true,
+      "quote_ttl_seconds": 60
+    },
+    "shopping": {
+      "max_order_usd": 50,
+      "daily_shopping_budget_usd": 200,
+      "merchant_allowlist": ["mock"],
+      "require_approval_for_checkout": true,
+      "category_blocklist": ["gift_cards", "crypto"]
+    }
+  },
+  "templates": {
+    "portfolio_watcher": {
+      "label": "Portfolio Watcher",
+      "description": "Read-only portfolio and price monitoring",
+      "agent_type": "trading",
+      "chain": [
+        { "tool": "get_portfolio", "policies": { "read_only": true } },
+        { "tool": "fetch_price", "policies": { "read_only": true } },
+        { "tool": "wallet_analytics", "policies": { "read_only": true } }
+      ]
+    },
+    "cautious_trader": {
+      "label": "Cautious Trader",
+      "description": "Quote-first swaps with spending caps and approval gates",
+      "agent_type": "trading",
+      "chain": [
+        { "tool": "get_portfolio", "policies": {} },
+        { "tool": "quote_swap", "policies": { "max_slippage_bps": 100 } },
+        { "tool": "swap", "policies": { "max_trade_notional_usd": 25, "approval_threshold_usd": 10, "daily_spend_budget_usd": 100, "max_slippage_bps": 100, "cooldown_seconds": 60 } }
+      ]
+    },
+    "shopping_researcher": {
+      "label": "Shopping Researcher",
+      "description": "Search and compare products without checkout",
+      "agent_type": "shopping",
+      "chain": [
+        { "tool": "product_search", "policies": { "merchant_allowlist": ["mock"] } },
+        { "tool": "product_details", "policies": { "merchant_allowlist": ["mock"] } }
+      ]
+    },
+    "guarded_shopper": {
+      "label": "Guarded Shopper",
+      "description": "Full shopping flow with checkout approval and order caps",
+      "agent_type": "shopping",
+      "chain": [
+        { "tool": "product_search", "policies": { "merchant_allowlist": ["mock"] } },
+        { "tool": "build_cart", "policies": { "max_order_usd": 50, "merchant_allowlist": ["mock"] } },
+        { "tool": "checkout_quote", "policies": { "max_order_usd": 50, "daily_shopping_budget_usd": 200 } },
+        { "tool": "place_order", "policies": { "max_order_usd": 50, "require_approval_for_checkout": true, "daily_shopping_budget_usd": 200 } }
+      ]
+    }
+  },
+  "tools": [
+    {
+      "id": "transfer",
+      "runtime_name": "transfer",
+      "workflow_builder_name": "transfer",
+      "label": "Transfer",
+      "description": "Transfer tokens from one address to another.",
+      "category": "chain_write",
+      "risk": "high",
+      "endpoint": "/transfer",
+      "method": "POST",
+      "requires_wallet": true,
+      "policy_hooks": ["max_notional", "daily_budget"],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "toAddress": { "type": "string", "description": "Recipient wallet address" },
+          "amount": { "type": "string", "description": "Amount of tokens to transfer" },
+          "tokenAddress": { "type": "string", "description": "Contract address of the token or 'native' for MON" }
+        },
+        "required": ["toAddress", "amount", "tokenAddress"]
+      }
+    },
+    {
+      "id": "swap",
+      "runtime_name": "swap",
+      "workflow_builder_name": "swap",
+      "label": "Swap",
+      "description": "Execute a token swap on Monad via Kuru Flow. Requires a fresh quoteId from quote_swap first.",
+      "category": "trade_write",
+      "risk": "high",
+      "endpoint": "/swap",
+      "method": "POST",
+      "requires_wallet": true,
+      "policy_hooks": ["max_notional", "allowed_tokens", "daily_budget", "slippage_cap", "quote_required"],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "quoteId": { "type": "string", "description": "Quote ID from quote_swap (required)" },
+          "slippageTolerance": { "type": "number", "description": "Slippage tolerance percentage (optional override)" }
+        },
+        "required": ["quoteId"]
+      }
+    },
+    {
+      "id": "quote_swap",
+      "runtime_name": "quote_swap",
+      "workflow_builder_name": "quote_swap",
+      "label": "Quote Swap",
+      "description": "Get a swap quote without executing. Returns quoteId for use with swap.",
+      "category": "trade_read",
+      "risk": "low",
+      "endpoint": "/quote-swap",
+      "method": "POST",
+      "requires_wallet": true,
+      "policy_hooks": ["allowed_tokens", "slippage_cap"],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "tokenIn": { "type": "string", "description": "Input token address or 'native' for MON" },
+          "tokenOut": { "type": "string", "description": "Output token address" },
+          "amountIn": { "type": "string", "description": "Amount of input tokens" },
+          "slippageTolerance": { "type": "number", "description": "Slippage tolerance percentage" }
+        },
+        "required": ["tokenIn", "tokenOut", "amountIn"]
+      }
+    },
+    {
+      "id": "get_portfolio",
+      "runtime_name": "get_portfolio",
+      "workflow_builder_name": "get_portfolio",
+      "label": "Portfolio",
+      "description": "Get wallet positions with estimated USD values.",
+      "category": "trade_read",
+      "risk": "low",
+      "endpoint": "/get-portfolio",
+      "method": "POST",
+      "requires_wallet": false,
+      "policy_hooks": [],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "address": { "type": "string", "description": "Wallet address (0x…). Uses agent wallet if omitted." }
+        },
+        "required": []
+      }
+    },
+    {
+      "id": "get_trade_history",
+      "runtime_name": "get_trade_history",
+      "workflow_builder_name": "get_trade_history",
+      "label": "Trade History",
+      "description": "Get recent trade actions for this agent.",
+      "category": "trade_read",
+      "risk": "low",
+      "endpoint": "/agents/{agentId}/actions",
+      "method": "GET",
+      "requires_wallet": false,
+      "policy_hooks": [],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "limit": { "type": "integer", "description": "Max records to return (default 10)" }
+        },
+        "required": []
+      }
+    },
+    {
+      "id": "get_balance",
+      "runtime_name": "get_balance",
+      "workflow_builder_name": "get_balance",
+      "label": "Get Balance",
+      "description": "Get Monad wallet analytics: native MON balance plus ERC-20 positions.",
+      "category": "chain_read",
+      "risk": "low",
+      "endpoint": "/api/balance/erc20",
+      "method": "POST",
+      "requires_wallet": false,
+      "policy_hooks": [],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "address": { "type": "string", "description": "Wallet address (0x…) to analyze" }
+        },
+        "required": ["address"]
+      }
+    },
+    {
+      "id": "deploy_erc20",
+      "runtime_name": "deploy_erc20",
+      "workflow_builder_name": "deploy_erc20",
+      "label": "Deploy ERC-20",
+      "description": "Deploy a new ERC-20 token on Monad Testnet via TokenFactory.",
+      "category": "chain_write",
+      "risk": "medium",
+      "endpoint": "/deploy-token",
+      "method": "POST",
+      "requires_wallet": true,
+      "policy_hooks": [],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "Token name" },
+          "symbol": { "type": "string", "description": "Token symbol" },
+          "decimals": { "type": "integer", "description": "Token decimals (commonly 18)" },
+          "initialSupply": { "type": "number", "description": "Initial supply in human units" }
+        },
+        "required": ["name", "symbol", "decimals", "initialSupply"]
+      }
+    },
+    {
+      "id": "deploy_erc721",
+      "runtime_name": "deploy_erc721",
+      "workflow_builder_name": "deploy_erc721",
+      "label": "Deploy ERC-721",
+      "description": "Deploy a new ERC-721 NFT collection.",
+      "category": "chain_write",
+      "risk": "medium",
+      "endpoint": "/create-nft-collection",
+      "method": "POST",
+      "requires_wallet": true,
+      "policy_hooks": [],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "NFT collection name" },
+          "symbol": { "type": "string", "description": "NFT collection symbol" }
+        },
+        "required": ["name", "symbol"]
+      }
+    },
+    {
+      "id": "create_dao",
+      "runtime_name": "create_dao",
+      "workflow_builder_name": "create_dao",
+      "label": "Create DAO",
+      "description": "Create a new DAO (Decentralized Autonomous Organization).",
+      "category": "chain_write",
+      "risk": "medium",
+      "endpoint": "/create-dao",
+      "method": "POST",
+      "requires_wallet": true,
+      "policy_hooks": [],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "DAO name" },
+          "votingPeriod": { "type": "string", "description": "Voting period in seconds" },
+          "quorumPercentage": { "type": "string", "description": "Quorum percentage required" }
+        },
+        "required": ["name", "votingPeriod", "quorumPercentage"]
+      }
+    },
+    {
+      "id": "airdrop",
+      "runtime_name": "airdrop",
+      "workflow_builder_name": "airdrop",
+      "label": "Airdrop",
+      "description": "Airdrop tokens to multiple recipients.",
+      "category": "chain_write",
+      "risk": "high",
+      "endpoint": "/airdrop",
+      "method": "POST",
+      "requires_wallet": true,
+      "policy_hooks": ["max_notional", "daily_budget"],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "recipients": { "type": "array", "items": { "type": "string" }, "description": "Recipient addresses" },
+          "amount": { "type": "string", "description": "Amount per recipient" }
+        },
+        "required": ["recipients", "amount"]
+      }
+    },
+    {
+      "id": "fetch_price",
+      "runtime_name": "fetch_price",
+      "workflow_builder_name": "fetch_price",
+      "label": "Fetch Price",
+      "description": "Fetch the current price of any cryptocurrency or token.",
+      "category": "chain_read",
+      "risk": "low",
+      "endpoint": "/token-price",
+      "method": "POST",
+      "requires_wallet": false,
+      "policy_hooks": [],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "Query string (e.g. 'bitcoin', 'MON')" }
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "id": "deposit_yield",
+      "runtime_name": "deposit_yield",
+      "workflow_builder_name": "deposit_yield",
+      "label": "Deposit Yield",
+      "description": "Create a deposit with yield prediction.",
+      "category": "chain_write",
+      "risk": "medium",
+      "endpoint": "/yield",
+      "method": "POST",
+      "requires_wallet": true,
+      "policy_hooks": [],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "tokenAddress": { "type": "string", "description": "Token contract address" },
+          "depositAmount": { "type": "string", "description": "Amount to deposit" },
+          "apyPercent": { "type": "number", "description": "APY percentage" }
+        },
+        "required": ["tokenAddress", "depositAmount", "apyPercent"]
+      }
+    },
+    {
+      "id": "wallet_analytics",
+      "runtime_name": "wallet_analytics",
+      "workflow_builder_name": "wallet_analytics",
+      "label": "Wallet Analytics",
+      "description": "Get Monad wallet analytics (native MON + ERC-20 positions).",
+      "category": "chain_read",
+      "risk": "low",
+      "endpoint": "/api/balance/erc20",
+      "method": "POST",
+      "requires_wallet": false,
+      "policy_hooks": [],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "address": { "type": "string", "description": "Wallet address to analyze" }
+        },
+        "required": ["address"]
+      }
+    },
+    {
+      "id": "product_search",
+      "runtime_name": "product_search",
+      "workflow_builder_name": "product_search",
+      "label": "Product Search",
+      "description": "Search products from a commerce provider. Use maxPriceUsd/minPriceUsd for budget filters (e.g. under $50). Put product keywords in query, not price text.",
+      "category": "commerce_read",
+      "risk": "low",
+      "endpoint": "/commerce/search",
+      "method": "POST",
+      "requires_wallet": false,
+      "policy_hooks": ["merchant_allowlist"],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "Product keywords (e.g. headphones, keyboard). Omit price words here." },
+          "provider": { "type": "string", "description": "Commerce provider id (default: mock)" },
+          "maxResults": { "type": "integer", "description": "Max results (default 5)" },
+          "maxPriceUsd": { "type": "number", "description": "Only products at or below this USD price" },
+          "minPriceUsd": { "type": "number", "description": "Only products at or above this USD price" }
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "id": "product_details",
+      "runtime_name": "product_details",
+      "workflow_builder_name": "product_details",
+      "label": "Product Details",
+      "description": "Get detailed information about a product.",
+      "category": "commerce_read",
+      "risk": "low",
+      "endpoint": "/commerce/product",
+      "method": "POST",
+      "requires_wallet": false,
+      "policy_hooks": ["merchant_allowlist"],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "productId": { "type": "string", "description": "Product ID" },
+          "provider": { "type": "string", "description": "Commerce provider id" }
+        },
+        "required": ["productId"]
+      }
+    },
+    {
+      "id": "build_cart",
+      "runtime_name": "build_cart",
+      "workflow_builder_name": "build_cart",
+      "label": "Build Cart",
+      "description": "Create a shopping cart with products.",
+      "category": "commerce_write",
+      "risk": "medium",
+      "endpoint": "/commerce/cart",
+      "method": "POST",
+      "requires_wallet": false,
+      "policy_hooks": ["max_order_usd", "merchant_allowlist"],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "productId": { "type": "string" },
+                "quantity": { "type": "integer" }
+              },
+              "required": ["productId", "quantity"]
+            },
+            "description": "Cart items"
+          },
+          "provider": { "type": "string", "description": "Commerce provider id" }
+        },
+        "required": ["items"]
+      }
+    },
+    {
+      "id": "checkout_quote",
+      "runtime_name": "checkout_quote",
+      "workflow_builder_name": "checkout_quote",
+      "label": "Checkout Quote",
+      "description": "Get checkout quote for a cart including tax and shipping.",
+      "category": "commerce_read",
+      "risk": "medium",
+      "endpoint": "/commerce/checkout-quote",
+      "method": "POST",
+      "requires_wallet": false,
+      "policy_hooks": ["max_order_usd", "daily_shopping_budget", "session_budget"],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "cartId": { "type": "string", "description": "Cart ID from build_cart" },
+          "provider": { "type": "string", "description": "Commerce provider id" }
+        },
+        "required": ["cartId"]
+      }
+    },
+    {
+      "id": "place_order",
+      "runtime_name": "place_order",
+      "workflow_builder_name": "place_order",
+      "label": "Place Order",
+      "description": "Place an order. Requires user approval in guarded shopping mode.",
+      "category": "commerce_write",
+      "risk": "high",
+      "endpoint": "/commerce/place-order",
+      "method": "POST",
+      "requires_wallet": false,
+      "policy_hooks": ["max_order_usd", "daily_shopping_budget", "require_approval", "session_budget"],
+      "llm_schema": {
+        "type": "object",
+        "properties": {
+          "cartId": { "type": "string", "description": "Cart ID" },
+          "approvalId": { "type": "string", "description": "Approval ID after user confirms checkout" },
+          "provider": { "type": "string", "description": "Commerce provider id" }
+        },
+        "required": ["cartId"]
+      }
+    }
+  ]
+}

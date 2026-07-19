@@ -12,8 +12,33 @@ _REGISTRY_CACHE: Optional[Dict[str, Any]] = None
 def _registry_path() -> Path:
     env_path = os.getenv("TOOL_REGISTRY_PATH")
     if env_path:
-        return Path(env_path)
-    return Path(__file__).resolve().parent.parent / "shared" / "tools" / "registry.json"
+        path = Path(env_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"TOOL_REGISTRY_PATH does not exist: {path}")
+        return path
+
+    here = Path(__file__).resolve().parent
+    candidates: List[Path] = [
+        # Railway / agent-only deploy (vendored copy)
+        here / "shared" / "tools" / "registry.json",
+        # Monorepo layout (local dev, repo-root deploy)
+        here.parent / "shared" / "tools" / "registry.json",
+    ]
+    for parent in here.parents:
+        candidates.append(parent / "shared" / "tools" / "registry.json")
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file():
+            return candidate
+
+    raise FileNotFoundError(
+        "Could not find shared/tools/registry.json. "
+        "Set TOOL_REGISTRY_PATH or include agent/shared/tools/registry.json in the deploy."
+    )
 
 
 def load_registry() -> Dict[str, Any]:

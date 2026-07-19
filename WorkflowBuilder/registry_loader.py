@@ -9,17 +9,40 @@ from typing import Any, Dict, List
 _CACHE: Dict[str, Any] | None = None
 
 
-def _path() -> Path:
-    env = os.getenv("TOOL_REGISTRY_PATH")
-    if env:
-        return Path(env)
-    return Path(__file__).resolve().parent.parent / "shared" / "tools" / "registry.json"
+def _registry_path() -> Path:
+    env_path = os.getenv("TOOL_REGISTRY_PATH")
+    if env_path:
+        path = Path(env_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"TOOL_REGISTRY_PATH does not exist: {path}")
+        return path
+
+    here = Path(__file__).resolve().parent
+    candidates: List[Path] = [
+        here / "shared" / "tools" / "registry.json",
+        here.parent / "shared" / "tools" / "registry.json",
+    ]
+    for parent in here.parents:
+        candidates.append(parent / "shared" / "tools" / "registry.json")
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file():
+            return candidate
+
+    raise FileNotFoundError(
+        "Could not find shared/tools/registry.json. "
+        "Set TOOL_REGISTRY_PATH or include WorkflowBuilder/shared/tools/registry.json in the deploy."
+    )
 
 
 def load_registry() -> Dict[str, Any]:
     global _CACHE
     if _CACHE is None:
-        with open(_path(), encoding="utf-8") as f:
+        with open(_registry_path(), encoding="utf-8") as f:
             _CACHE = json.load(f)
     return _CACHE
 
