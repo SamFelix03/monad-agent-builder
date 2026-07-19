@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Agent Workflow Builder API")
 WORKFLOW_BUILDER_PORT = 8001
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 _groq_key = os.getenv("GROQ_API_KEY")
 groq_client: Optional[Groq] = Groq(api_key=_groq_key) if _groq_key else None
 
