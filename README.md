@@ -25,8 +25,6 @@ Building on-chain agents today usually means wiring LLMs, wallets, RPCs, and saf
 | Commerce read/write | 5 |
 | **Total** | **18** |
 
-Source of truth: [`shared/tools/registry.json`](https://github.com/SamFelix03/monad-agent-builder/blob/main/shared/tools/registry.json)
-
 ---
 
 ## Resources
@@ -76,12 +74,6 @@ These txs were executed through the agent → backend tool pipeline (wallet sign
 | `get_balance` / `wallet_analytics` | — | Read-only API ([main.js#L2128](https://github.com/SamFelix03/monad-agent-builder/blob/main/backend/main.js#L2128)) |
 | `quote_swap` / `get_portfolio` / `get_trade_history` | — | Read-only API ([extensions.js](https://github.com/SamFelix03/monad-agent-builder/blob/main/backend/routes/extensions.js)) |
 | Commerce tools (`product_search` … `place_order`) | — | Off-chain mock ([commerce/mock.js](https://github.com/SamFelix03/monad-agent-builder/blob/main/backend/commerce/mock.js)) |
-
-Re-run demos locally or against Railway: [`scripts/run-tool-demos.sh`](scripts/run-tool-demos.sh)
-
-### Source code links
-
-All paths in this README link to [`main` on GitHub](https://github.com/SamFelix03/monad-agent-builder/tree/main). Format: `path#Lline` (e.g. [backend/main.js#L295](https://github.com/SamFelix03/monad-agent-builder/blob/main/backend/main.js#L295)).
 
 ---
 
